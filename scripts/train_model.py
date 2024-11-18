@@ -36,14 +36,6 @@ async def train_model(config_path: str, symbol: str, device: Optional[str] = Non
 
         await data_fetcher.initialize()
 
-        market_analyzer = MarketAnalyzer(None)  # No event manager needed for training
-
-        trader = Trader(
-            model_dir=config_manager.config["trader"]["model_dir"],
-            tensorboard_log=config_manager.config["trader"]["tensorboard_log"],
-            device=device,
-        )
-
         # Calculate date range for training data
         end_date = datetime.now()
         days = int(training_config["data_window"].replace("d", ""))
@@ -51,7 +43,7 @@ async def train_model(config_path: str, symbol: str, device: Optional[str] = Non
 
         print(f"Fetching training data from {start_date} to {end_date}")
 
-        # Fetch historical data
+        # Fetch historical data with progress updates
         data = await data_fetcher.get_historical_data(
             symbol=symbol,
             timeframe="1h",  # Base timeframe for training
@@ -61,31 +53,47 @@ async def train_model(config_path: str, symbol: str, device: Optional[str] = Non
 
         print(f"Fetched {len(data)} data points")
 
+        if len(data) < 1000:
+            raise ValueError("Insufficient data points for training")
+
         # Prepare training data
         train_size = int(len(data) * training_config["train_test_split"])
         train_data = data[:train_size]
         test_data = data[train_size:]
 
-        print("Training model...")
+        print(f"Training set size: {len(train_data)} points")
+        print(f"Test set size: {len(test_data)} points")
 
         # Train model
-        await trader.train_model(
+        print("Training model...")
+        total_timesteps = training_config["epochs"] * len(train_data)
+        print(f"Total training steps: {total_timesteps}")
+
+        trader = Trader(
+            model_dir=config_manager.config["trader"]["model_dir"],
+            tensorboard_log=config_manager.config["trader"]["tensorboard_log"],
+            device=device,
+        )
+
+        trader.train_model(
             train_data=train_data,
             eval_data=test_data,
             hyperparams=training_config["model_params"],
-            total_timesteps=training_config["epochs"] * len(train_data),
+            total_timesteps=total_timesteps,
         )
 
         print("Training completed!")
 
         # Evaluate model
         print("Evaluating model...")
-        metrics = await trader.evaluate_performance(test_data)
+        metrics = trader.evaluate_performance(test_data)
 
         print("\nEvaluation Metrics:")
+        print(f"Total Return: {metrics['total_return']:.2%}")
         print(f"Sharpe Ratio: {metrics['sharpe_ratio']:.2f}")
         print(f"Max Drawdown: {metrics['max_drawdown']:.2%}")
         print(f"Win Rate: {metrics['win_rate']:.2%}")
+        print(f"Total Trades: {metrics['total_trades']}")
         print(f"Profit Factor: {metrics['profit_factor']:.2f}")
 
     except Exception as e:

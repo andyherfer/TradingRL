@@ -164,53 +164,110 @@ class DataFetcher:
         symbol: str,
         timeframe: str,
         start_time: datetime,
-        end_time: Optional[datetime] = None,
-        include_indicators: bool = True,
+        end_time: datetime,
+        use_cache: bool = True,
     ) -> pd.DataFrame:
-        """
-        Fetch historical market data.
-
-        Args:
-            symbol: Trading pair
-            timeframe: Timeframe (e.g., "1m", "5m")
-            start_time: Start time
-            end_time: End time (optional)
-            include_indicators: Whether to include technical indicators
-
-        Returns:
-            DataFrame with market data
-        """
+        """Fetch historical market data."""
         try:
-            cache_key = f"{symbol}_{timeframe}_{start_time}_{end_time}"
+            # Convert timeframe to Binance format
+            timeframe_map = {
+                "1m": "1m",
+                "3m": "3m",
+                "5m": "5m",
+                "15m": "15m",
+                "30m": "30m",
+                "1h": "1h",
+                "2h": "2h",
+                "4h": "4h",
+                "6h": "6h",
+                "8h": "8h",
+                "12h": "12h",
+                "1d": "1d",
+                "3d": "3d",
+                "1w": "1w",
+                "1M": "1M",
+            }
+
+            binance_timeframe = timeframe_map.get(timeframe)
+            if not binance_timeframe:
+                raise ValueError(f"Unsupported timeframe: {timeframe}")
 
             # Check cache
-            if self.config.use_cache and cache_key in self.cache:
-                data = self.cache[cache_key]
-                if self._is_cache_valid(cache_key):
-                    return data
+            cache_key = f"{symbol}_{timeframe}_{start_time.date()}_{end_time.date()}"
+            if use_cache:
+                cached_data = await self._load_from_cache(
+                    symbol, timeframe, start_time, end_time
+                )
+                if cached_data is not None and len(cached_data) >= 1000:
+                    logger.info(f"Using cached data for {cache_key}")
+                    return cached_data
 
-            # Fetch data
-            end_time = end_time or datetime.now()
-            data = await self._fetch_historical_klines(
-                symbol, timeframe, start_time, end_time
+            logger.info(
+                f"Fetching historical data for {symbol} from {start_time} to {end_time}"
             )
 
-            # Process data
-            df = self._process_klines(data)
+            # Split into smaller time chunks
+            chunk_size = timedelta(days=7)  # Fetch 7 days at a time
+            current_start = start_time
+            all_data = []
+            retry_count = 3
 
-            # Calculate indicators if requested
-            if include_indicators:
-                df = self._add_technical_indicators(df)
+            while current_start < end_time and retry_count > 0:
+                try:
+                    current_end = min(current_start + chunk_size, end_time)
 
-            # Cache data
-            if self.config.use_cache:
-                self.cache[cache_key] = df
-                self.cache_timestamps[cache_key] = time.time()
+                    # Fetch chunk
+                    chunk_data = await self._fetch_historical_klines(
+                        symbol=symbol,
+                        interval=binance_timeframe,
+                        start_time=current_start,
+                        end_time=current_end,
+                    )
 
-            return df
+                    if not chunk_data.empty:
+                        all_data.append(chunk_data)
+                        logger.info(
+                            f"Fetched chunk: {len(chunk_data)} points from {current_start.date()} to {current_end.date()}"
+                        )
+                        current_start = current_end
+                    else:
+                        logger.warning(
+                            f"No data for period {current_start.date()} to {current_end.date()}"
+                        )
+                        retry_count -= 1
+
+                    await asyncio.sleep(0.5)  # Rate limiting between chunks
+
+                except Exception as e:
+                    logger.error(f"Error fetching chunk: {e}")
+                    retry_count -= 1
+                    await asyncio.sleep(1)
+
+            if not all_data:
+                logger.warning(f"No data returned for {symbol} {timeframe}")
+                return pd.DataFrame()
+
+            # Combine chunks
+            data = pd.concat(all_data)
+            data = data.sort_index().drop_duplicates()
+
+            if len(data) < 1000:
+                logger.warning(f"Insufficient data points: {len(data)}")
+                return pd.DataFrame()
+
+            # Add technical indicators
+            data = self._add_technical_indicators(data)
+
+            # Cache the data
+            if use_cache and len(data) >= 1000:
+                await self._save_to_cache(data, symbol, timeframe, start_time, end_time)
+                logger.info(f"Cached data for {cache_key}")
+
+            logger.info(f"Successfully fetched {len(data)} data points")
+            return data
 
         except Exception as e:
-            self.logger.error(f"Error fetching historical data: {e}")
+            logger.error(f"Error fetching historical data: {e}")
             raise
 
     async def subscribe_data(
@@ -360,7 +417,8 @@ class DataFetcher:
 
             while current_start < end_ts:
                 try:
-                    # Fetch a batch of klines with correct parameters
+                    # Use production API endpoint
+                    endpoint = f"https://api.binance.com/api/v3/klines"
                     params = {
                         "symbol": formatted_symbol,
                         "interval": interval,
@@ -369,35 +427,37 @@ class DataFetcher:
                         "limit": 1000,
                     }
 
-                    klines = await self.client.get_historical_klines(
-                        symbol=formatted_symbol,
-                        interval=interval,
-                        start_str=str(current_start),
-                        end_str=str(end_ts),
-                        limit=1000,
-                    )
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(endpoint, params=params) as response:
+                            if response.status == 200:
+                                klines = await response.json()
+                                if not klines:
+                                    break
 
-                    if not klines:
-                        break
+                                all_klines.extend(klines)
+                                logger.info(f"Fetched {len(klines)} klines")
 
-                    all_klines.extend(klines)
+                                # Update the start time for the next batch
+                                if klines:
+                                    current_start = klines[-1][0] + 1
+                                else:
+                                    break
 
-                    # Update the start time for the next batch
-                    if klines:
-                        current_start = klines[-1][0] + 1
-                    else:
-                        break
-
-                    # Rate limiting
-                    await asyncio.sleep(0.5)  # Add delay to avoid rate limits
+                                # Rate limiting
+                                await asyncio.sleep(
+                                    0.1
+                                )  # Reduced delay for production API
+                            else:
+                                raise Exception(
+                                    f"API returned status code {response.status}"
+                                )
 
                 except Exception as e:
                     logger.error(f"Error fetching batch of klines: {e}")
                     if retry_count > 0:
                         await asyncio.sleep(1)
-                        return await self._fetch_historical_klines(
-                            symbol, interval, start_time, end_time, retry_count - 1
-                        )
+                        retry_count -= 1
+                        continue
                     raise
 
             # Convert to DataFrame
@@ -430,6 +490,7 @@ class DataFetcher:
             df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
             df.set_index("timestamp", inplace=True)
 
+            logger.info(f"Successfully processed {len(df)} data points")
             return df[["open", "high", "low", "close", "volume"]]
 
         except Exception as e:
@@ -866,11 +927,11 @@ class DataFetcher:
     async def initialize(self) -> None:
         """Initialize exchange clients."""
         try:
-            # Initialize Binance client with testnet
+            # Initialize Binance client for production API (for historical data)
             self.client = await AsyncClient.create(
                 api_key=self.api_key,
                 api_secret=self.api_secret,
-                testnet=True,  # Enable testnet
+                testnet=False,  # Use production API for historical data
             )
 
             # Initialize CCXT client as backup
@@ -879,17 +940,12 @@ class DataFetcher:
                     "apiKey": self.api_key,
                     "secret": self.api_secret,
                     "enableRateLimit": True,
-                    "options": {"defaultType": "future"},
-                    "urls": {
-                        "api": {
-                            "public": "https://testnet.binance.vision/api/v3",
-                            "private": "https://testnet.binance.vision/api/v3",
-                        }
+                    "options": {
+                        "adjustForTimeDifference": True,
                     },
                 }
             )
 
-            self.exchange.set_sandbox_mode(True)
             logger.info("Data fetcher initialized successfully")
 
         except Exception as e:
@@ -902,254 +958,6 @@ class DataFetcher:
             await self.client.close_connection()
         if self.exchange:
             await self.exchange.close()
-
-    async def get_historical_data(
-        self,
-        symbol: str,
-        timeframe: str,
-        start_time: datetime,
-        end_time: datetime,
-        use_cache: bool = True,
-    ) -> pd.DataFrame:
-        """
-        Fetch historical market data for a given symbol and timeframe.
-
-        Args:
-            symbol: Trading pair symbol (e.g., 'BTC/USDT')
-            timeframe: Candlestick timeframe (e.g., '1h', '4h', '1d')
-            start_time: Start time
-            end_time: End time
-            use_cache: Whether to use cached data if available
-
-        Returns:
-            DataFrame with OHLCV data and technical indicators
-        """
-        try:
-            # Convert timeframe to Binance format
-            timeframe_map = {
-                "1m": "1m",
-                "3m": "3m",
-                "5m": "5m",
-                "15m": "15m",
-                "30m": "30m",
-                "1h": "1h",
-                "2h": "2h",
-                "4h": "4h",
-                "6h": "6h",
-                "8h": "8h",
-                "12h": "12h",
-                "1d": "1d",
-                "3d": "3d",
-                "1w": "1w",
-                "1M": "1M",
-            }
-
-            binance_timeframe = timeframe_map.get(timeframe)
-            if not binance_timeframe:
-                raise ValueError(f"Unsupported timeframe: {timeframe}")
-
-            # Check cache first if enabled
-            if use_cache:
-                cached_data = await self._load_from_cache(
-                    symbol, timeframe, start_time, end_time
-                )
-                if cached_data is not None:
-                    return cached_data
-
-            # Fetch historical klines
-            data = await self._fetch_historical_klines(
-                symbol=symbol,
-                interval=binance_timeframe,
-                start_time=start_time,
-                end_time=end_time,
-            )
-
-            if data.empty:
-                logger.warning(f"No data returned for {symbol} {timeframe}")
-                return pd.DataFrame()
-
-            # Add technical indicators
-            data = self._add_technical_indicators(data)
-
-            # Cache the data if enabled
-            if use_cache:
-                await self._save_to_cache(data, symbol, timeframe, start_time, end_time)
-
-            return data
-
-        except Exception as e:
-            logger.error(f"Error fetching historical data: {e}")
-            raise
-
-    async def _fetch_historical_klines(
-        self,
-        symbol: str,
-        interval: str,
-        start_time: datetime,
-        end_time: datetime,
-        retry_count: int = 3,
-    ) -> pd.DataFrame:
-        """Fetch historical klines (candlestick data) from the exchange."""
-        try:
-            # Convert symbol format if needed (e.g., BTC/USDT -> BTCUSDT)
-            formatted_symbol = symbol.replace("/", "")
-
-            # Convert timestamps to milliseconds
-            start_ts = int(start_time.timestamp() * 1000)
-            end_ts = int(end_time.timestamp() * 1000)
-
-            all_klines = []
-            current_start = start_ts
-
-            while current_start < end_ts:
-                try:
-                    # Fetch a batch of klines with correct parameters
-                    params = {
-                        "symbol": formatted_symbol,
-                        "interval": interval,
-                        "startTime": current_start,
-                        "endTime": end_ts,
-                        "limit": 1000,
-                    }
-
-                    klines = await self.client.get_historical_klines(
-                        symbol=formatted_symbol,
-                        interval=interval,
-                        start_str=str(current_start),
-                        end_str=str(end_ts),
-                        limit=1000,
-                    )
-
-                    if not klines:
-                        break
-
-                    all_klines.extend(klines)
-
-                    # Update the start time for the next batch
-                    if klines:
-                        current_start = klines[-1][0] + 1
-                    else:
-                        break
-
-                    # Rate limiting
-                    await asyncio.sleep(0.5)  # Add delay to avoid rate limits
-
-                except Exception as e:
-                    logger.error(f"Error fetching batch of klines: {e}")
-                    if retry_count > 0:
-                        await asyncio.sleep(1)
-                        return await self._fetch_historical_klines(
-                            symbol, interval, start_time, end_time, retry_count - 1
-                        )
-                    raise
-
-            # Convert to DataFrame
-            if not all_klines:
-                return pd.DataFrame()
-
-            df = pd.DataFrame(
-                all_klines,
-                columns=[
-                    "timestamp",
-                    "open",
-                    "high",
-                    "low",
-                    "close",
-                    "volume",
-                    "close_time",
-                    "quote_volume",
-                    "trades",
-                    "taker_buy_base",
-                    "taker_buy_quote",
-                    "ignored",
-                ],
-            )
-
-            # Convert types
-            numeric_columns = ["open", "high", "low", "close", "volume"]
-            df[numeric_columns] = df[numeric_columns].astype(float)
-
-            # Convert timestamp to datetime index
-            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-            df.set_index("timestamp", inplace=True)
-
-            return df[["open", "high", "low", "close", "volume"]]
-
-        except Exception as e:
-            logger.error(f"Error fetching historical klines: {e}")
-            raise
-
-    def _add_technical_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Add technical indicators to the DataFrame."""
-        try:
-            # Calculate basic indicators
-            df["sma_20"] = df["close"].rolling(window=20).mean()
-            df["sma_50"] = df["close"].rolling(window=50).mean()
-            df["rsi"] = self._calculate_rsi(df["close"], periods=14)
-            df["atr"] = self._calculate_atr(df, periods=14)
-
-            # Add momentum indicators
-            df["macd"], df["macd_signal"], df["macd_hist"] = self._calculate_macd(
-                df["close"]
-            )
-
-            # Add volatility indicators
-            df["bollinger_upper"], df["bollinger_middle"], df["bollinger_lower"] = (
-                self._calculate_bollinger_bands(df["close"])
-            )
-
-            return df.dropna()  # Remove any rows with NaN values
-
-        except Exception as e:
-            logger.error(f"Error adding technical indicators: {e}")
-            raise
-
-    # Add helper methods for technical indicators...
-    def _calculate_rsi(self, prices: pd.Series, periods: int = 14) -> pd.Series:
-        """Calculate Relative Strength Index."""
-        delta = prices.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=periods).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=periods).mean()
-        rs = gain / loss
-        return 100 - (100 / (1 + rs))
-
-    def _calculate_macd(
-        self,
-        prices: pd.Series,
-        fast_period: int = 12,
-        slow_period: int = 26,
-        signal_period: int = 9,
-    ) -> tuple:
-        """Calculate MACD, Signal line, and MACD histogram."""
-        exp1 = prices.ewm(span=fast_period, adjust=False).mean()
-        exp2 = prices.ewm(span=slow_period, adjust=False).mean()
-        macd = exp1 - exp2
-        signal = macd.ewm(span=signal_period, adjust=False).mean()
-        hist = macd - signal
-        return macd, signal, hist
-
-    def _calculate_bollinger_bands(
-        self, prices: pd.Series, window: int = 20, num_std: float = 2
-    ) -> tuple:
-        """Calculate Bollinger Bands."""
-        middle = prices.rolling(window=window).mean()
-        std = prices.rolling(window=window).std()
-        upper = middle + (std * num_std)
-        lower = middle - (std * num_std)
-        return upper, middle, lower
-
-    def _calculate_atr(self, df: pd.DataFrame, periods: int = 14) -> pd.Series:
-        """Calculate Average True Range."""
-        high = df["high"]
-        low = df["low"]
-        close = df["close"]
-
-        tr1 = high - low
-        tr2 = abs(high - close.shift())
-        tr3 = abs(low - close.shift())
-
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        return tr.rolling(window=periods).mean()
 
     async def _load_from_cache(
         self,

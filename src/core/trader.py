@@ -87,7 +87,15 @@ class TradingEnvironment(gym.Env):
     def __init__(self, data: pd.DataFrame, initial_balance: float = 10000.0):
         super(TradingEnvironment, self).__init__()
 
-        self.data = data
+        # Initialize logger
+        self.logger = logging.getLogger(self.__class__.__name__)
+
+        # Store original data for price information
+        self.raw_data = data.copy()
+
+        # Preprocess data for features
+        self.data = self._preprocess_data(data)
+
         self.initial_balance = initial_balance
         self.commission_rate = 0.001  # 0.1% commission per trade
 
@@ -95,12 +103,12 @@ class TradingEnvironment(gym.Env):
         self.action_space = spaces.Discrete(3)  # 0: hold, 1: buy, 2: sell
 
         # Calculate the number of features
-        self.num_features = len(data.columns)
+        self.num_features = len(self.data.columns)
 
         # Observation space: price data + technical indicators + position info
         self.observation_space = spaces.Box(
-            low=-np.inf,
-            high=np.inf,
+            low=-10,  # Reasonable lower bound after normalization
+            high=10,  # Reasonable upper bound after normalization
             shape=(self.num_features + 3,),  # +3 for balance, position, position_value
             dtype=np.float32,
         )
@@ -109,6 +117,155 @@ class TradingEnvironment(gym.Env):
         self.trade_history = []
         self.np_random = None
         self.reset()
+
+    def _preprocess_data(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Preprocess and normalize the data."""
+        try:
+            # Make a copy to avoid modifying the original data
+            df = data.copy()
+
+            # Forward fill any missing values
+            df = df.ffill()
+
+            # Backward fill any remaining missing values at the start
+            df = df.bfill()
+
+            # Calculate returns and volatility
+            df["returns"] = df["close"].pct_change()
+            df["volatility"] = df["returns"].rolling(window=20).std()
+
+            # Replace any infinite values with large numbers
+            df = df.replace([np.inf, -np.inf], np.nan)
+            df = df.fillna(0)
+
+            # Calculate normalized price features
+            price_cols = ["open", "high", "low", "close"]
+            for col in price_cols:
+                # Use log returns instead of percentage change
+                with np.errstate(divide="ignore"):  # Handle divide by zero in log
+                    df[f"{col}_ret"] = np.log(df[col]).diff()
+
+                # Calculate rolling z-score
+                rolling_mean = df[col].rolling(window=20, min_periods=1).mean()
+                rolling_std = df[col].rolling(window=20, min_periods=1).std()
+                df[f"{col}_zscore"] = (df[col] - rolling_mean) / (rolling_std + 1e-8)
+
+            # Normalize volume using log transform and z-score
+            with np.errstate(divide="ignore"):  # Handle divide by zero in log
+                df["volume_ret"] = np.log(df["volume"]).diff()
+            volume_mean = df["volume"].rolling(window=20, min_periods=1).mean()
+            volume_std = df["volume"].rolling(window=20, min_periods=1).std()
+            df["volume_zscore"] = (df["volume"] - volume_mean) / (volume_std + 1e-8)
+
+            # Calculate price momentum features
+            for period in [5, 10, 20]:
+                df[f"momentum_{period}"] = df["close"].pct_change(period)
+                df[f"volume_momentum_{period}"] = df["volume"].pct_change(period)
+
+            # Calculate moving averages and relative strength
+            for period in [10, 20, 50]:
+                df[f"ma_{period}"] = df["close"].rolling(window=period).mean()
+                df[f"ma_{period}_slope"] = df[f"ma_{period}"].pct_change(5)
+                df[f"price_to_ma_{period}"] = df["close"] / df[f"ma_{period}"] - 1
+
+            # Volatility features
+            df["high_low_range"] = (df["high"] - df["low"]) / df["close"]
+            with np.errstate(divide="ignore"):  # Handle divide by zero in log
+                df["daily_range"] = np.log(df["high"]) - np.log(df["low"])
+
+            # Final feature selection
+            feature_cols = (
+                [f"{col}_ret" for col in price_cols]
+                + [f"{col}_zscore" for col in price_cols]
+                + [
+                    "volume_ret",
+                    "volume_zscore",
+                    "volatility",
+                    "high_low_range",
+                    "daily_range",
+                ]
+                + [f"momentum_{period}" for period in [5, 10, 20]]
+                + [f"volume_momentum_{period}" for period in [5, 10, 20]]
+                + [f"ma_{period}_slope" for period in [10, 20, 50]]
+                + [f"price_to_ma_{period}" for period in [10, 20, 50]]
+            )
+
+            # Drop rows with NaN values at the beginning
+            df = df.dropna()
+
+            # Ensure all values are finite and within reasonable bounds
+            for col in feature_cols:
+                df[col] = df[col].clip(-10, 10)
+
+                # Additional check for NaN values
+                if df[col].isna().any():
+                    self.logger.warning(f"NaN values found in {col}, filling with 0")
+                    df[col] = df[col].fillna(0)
+
+            # Final verification
+            if df[feature_cols].isna().any().any():
+                problematic_cols = (
+                    df[feature_cols].columns[df[feature_cols].isna().any()].tolist()
+                )
+                raise ValueError(
+                    f"NaN values still present in columns: {problematic_cols}"
+                )
+
+            # Keep only the feature columns
+            result_df = df[feature_cols]
+
+            # Log the shape of the processed data
+            self.logger.info(f"Preprocessed data shape: {result_df.shape}")
+            self.logger.info(f"Features used: {feature_cols}")
+
+            return result_df
+
+        except Exception as e:
+            self.logger.error(f"Error preprocessing data: {str(e)}")
+            raise ValueError(f"Error preprocessing data: {str(e)}")
+
+    def _get_observation(self):
+        """Get the current observation."""
+        try:
+            # Get current market data
+            market_data = self.data.iloc[self.current_step].values
+
+            # Calculate normalized account info
+            # Use close_ret instead of close_pct for position normalization
+            current_price = float(self.data.iloc[self.current_step]["close_ret"])
+
+            account_info = np.array(
+                [
+                    self.balance / self.initial_balance - 1,  # Normalized balance
+                    self.position
+                    / (
+                        self.initial_balance / (current_price + 1e-8)
+                    ),  # Normalized position
+                    self.position_value / self.initial_balance
+                    - 1,  # Normalized position value
+                ]
+            )
+
+            # Combine and ensure no NaN values
+            obs = np.concatenate([market_data, account_info])
+
+            # Check for and handle NaN/inf values
+            if np.any(np.isnan(obs)) or np.any(np.isinf(obs)):
+                self.logger.warning(
+                    "Found NaN or inf values in observation, replacing with 0"
+                )
+                obs = np.nan_to_num(obs, nan=0.0, posinf=1.0, neginf=-1.0)
+
+            # Clip values to observation space bounds
+            obs = np.clip(obs, self.observation_space.low, self.observation_space.high)
+
+            return obs.astype(np.float32)
+
+        except Exception as e:
+            self.logger.error(f"Error creating observation: {str(e)}")
+            self.logger.error(f"Current data columns: {self.data.columns.tolist()}")
+            self.logger.error(f"Current step: {self.current_step}")
+            raise ValueError(f"Error creating observation: {str(e)}")
 
     def reset(
         self, *, seed: Optional[int] = None, options: Optional[dict] = None
@@ -141,31 +298,10 @@ class TradingEnvironment(gym.Env):
 
         return initial_observation, info
 
-    def _get_observation(self):
-        """Get the current observation."""
-        # Get current market data
-        market_data = self.data.iloc[self.current_step].values
-
-        # Add account information
-        account_info = np.array([self.balance, self.position, self.position_value])
-
-        return np.concatenate([market_data, account_info])
-
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, dict]:
-        """
-        Execute one time step within the environment.
-
-        Args:
-            action: Action to take (0: hold, 1: buy, 2: sell)
-
-        Returns:
-            observation: New observation
-            reward: Reward for the action
-            terminated: Whether the episode is terminated
-            truncated: Whether the episode was truncated
-            info: Additional information
-        """
-        current_price = self.data.iloc[self.current_step]["close"]
+        """Execute one time step within the environment."""
+        # Use raw_data for price information
+        current_price = float(self.raw_data.iloc[self.current_step]["close"])
         old_portfolio_value = self.balance + self.position_value
 
         # Execute trading action
@@ -181,7 +317,7 @@ class TradingEnvironment(gym.Env):
                 # Record trade
                 self.trade_history.append(
                     Trade(
-                        timestamp=self.data.index[self.current_step],
+                        timestamp=self.raw_data.index[self.current_step],
                         action="buy",
                         price=current_price,
                         position=new_position,
@@ -203,7 +339,7 @@ class TradingEnvironment(gym.Env):
                 # Record trade
                 self.trade_history.append(
                     Trade(
-                        timestamp=self.data.index[self.current_step],
+                        timestamp=self.raw_data.index[self.current_step],
                         action="sell",
                         price=current_price,
                         position=self.position,
@@ -237,9 +373,55 @@ class TradingEnvironment(gym.Env):
             "position": self.position,
             "balance": self.balance,
             "trade_history": self.trade_history,
+            "current_price": current_price,
         }
 
         return obs, reward, terminated, truncated, info
+
+    def _plot_trading_actions(self, title: str = "Trading Actions") -> plt.Figure:
+        """Create a plot of price with buy/sell markers."""
+        fig, ax = plt.subplots(figsize=(15, 7))
+
+        # Plot price using raw_data
+        ax.plot(self.raw_data.index, self.raw_data["close"], label="Price", alpha=0.7)
+
+        # Plot buy points
+        buy_trades = [t for t in self.trade_history if t.action == "buy"]
+        if buy_trades:
+            buy_times = [t.timestamp for t in buy_trades]
+            buy_prices = [t.price for t in buy_trades]
+            ax.scatter(
+                buy_times,
+                buy_prices,
+                color="green",
+                marker="^",
+                s=100,
+                label="Buy",
+                alpha=0.7,
+            )
+
+        # Plot sell points
+        sell_trades = [t for t in self.trade_history if t.action == "sell"]
+        if sell_trades:
+            sell_times = [t.timestamp for t in sell_trades]
+            sell_prices = [t.price for t in sell_trades]
+            ax.scatter(
+                sell_times,
+                sell_prices,
+                color="red",
+                marker="v",
+                s=100,
+                label="Sell",
+                alpha=0.7,
+            )
+
+        ax.set_title(title)
+        ax.set_xlabel("Date")
+        ax.set_ylabel("Price")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+        return fig
 
 
 def get_device() -> str:
@@ -249,7 +431,7 @@ def get_device() -> str:
     """
     if torch.cuda.is_available():
         return "cuda"
-    elif platform.processor() == "arm" and torch.backends.mps.is_available():
+    elif torch.backends.mps.is_available():
         return "mps"
     return "cpu"
 
@@ -280,56 +462,6 @@ class Trader:
         self.model = None
         self.env = None
 
-    def _plot_trading_actions(
-        self,
-        data: pd.DataFrame,
-        trade_history: List[Trade],
-        title: str = "Trading Actions",
-    ) -> plt.Figure:
-        """Create a plot of price with buy/sell markers."""
-        fig, ax = plt.subplots(figsize=(15, 7))
-
-        # Plot price
-        ax.plot(data.index, data["close"], label="Price", alpha=0.7)
-
-        # Plot buy points
-        buy_trades = [t for t in trade_history if t.action == "buy"]
-        if buy_trades:
-            buy_times = [t.timestamp for t in buy_trades]
-            buy_prices = [t.price for t in buy_trades]
-            ax.scatter(
-                buy_times,
-                buy_prices,
-                color="green",
-                marker="^",
-                s=100,
-                label="Buy",
-                alpha=0.7,
-            )
-
-        # Plot sell points
-        sell_trades = [t for t in trade_history if t.action == "sell"]
-        if sell_trades:
-            sell_times = [t.timestamp for t in sell_trades]
-            sell_prices = [t.price for t in sell_trades]
-            ax.scatter(
-                sell_times,
-                sell_prices,
-                color="red",
-                marker="v",
-                s=100,
-                label="Sell",
-                alpha=0.7,
-            )
-
-        ax.set_title(title)
-        ax.set_xlabel("Date")
-        ax.set_ylabel("Price")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-
-        return fig
-
     def train_model(
         self,
         train_data: pd.DataFrame,
@@ -338,64 +470,64 @@ class Trader:
         total_timesteps: int = 100000,
     ) -> None:
         """Train the RL model with given data and hyperparameters."""
-        # Initialize wandb
-        wandb.init(
-            project=self.project_name,
-            config={
-                "model_type": "PPO",
-                "total_timesteps": total_timesteps,
-                "device": self.device,
-                **(hyperparams or {}),
-            },
-        )
-
-        # Default hyperparameters if none provided
-        if hyperparams is None:
-            hyperparams = {
-                "learning_rate": 0.0003,
-                "n_steps": 2048,
-                "batch_size": 64,
-                "n_epochs": 10,
-                "gamma": 0.99,
-                "gae_lambda": 0.95,
-                "clip_range": 0.2,
-                "ent_coef": 0.01,
-                "vf_coef": 0.5,
-                "max_grad_norm": 0.5,
-            }
-
-        # Create environments
-        self.env = Monitor(self.create_environment(train_data))
-        eval_env = Monitor(self.create_environment(eval_data))
-
-        # Initialize model with device
-        self.model = PPO(
-            "MlpPolicy",
-            self.env,
-            verbose=1,
-            tensorboard_log=self.tensorboard_log,
-            device=self.device,
-            **hyperparams,
-        )
-
-        # Setup callbacks
-        wandb_callback = WandBCallback(check_freq=1000)
-
-        checkpoint_callback = CheckpointCallback(
-            save_freq=10000, save_path=self.model_dir, name_prefix="ppo_trader"
-        )
-
-        eval_callback = EvalCallback(
-            eval_env,
-            best_model_save_path=f"{self.model_dir}/best_model",
-            log_path=f"{self.model_dir}/eval_results",
-            eval_freq=10000,
-            deterministic=True,
-            render=False,
-        )
-
-        # Train the model
         try:
+            # Initialize wandb
+            wandb.init(
+                project=self.project_name,
+                config={
+                    "model_type": "PPO",
+                    "total_timesteps": total_timesteps,
+                    "device": self.device,
+                    **(hyperparams or {}),
+                },
+            )
+
+            # Default hyperparameters if none provided
+            if hyperparams is None:
+                hyperparams = {
+                    "learning_rate": 0.0003,
+                    "n_steps": 2048,
+                    "batch_size": 64,
+                    "n_epochs": 10,
+                    "gamma": 0.99,
+                    "gae_lambda": 0.95,
+                    "clip_range": 0.2,
+                    "ent_coef": 0.01,
+                    "vf_coef": 0.5,
+                    "max_grad_norm": 0.5,
+                }
+
+            # Create environments
+            self.env = Monitor(self.create_environment(train_data))
+            eval_env = Monitor(self.create_environment(eval_data))
+
+            # Initialize model with device
+            self.model = PPO(
+                "MlpPolicy",
+                self.env,
+                verbose=1,
+                tensorboard_log=self.tensorboard_log,
+                device=self.device,
+                **hyperparams,
+            )
+
+            # Setup callbacks
+            wandb_callback = WandBCallback(check_freq=1000)
+
+            checkpoint_callback = CheckpointCallback(
+                save_freq=10000, save_path=self.model_dir, name_prefix="ppo_trader"
+            )
+
+            eval_callback = EvalCallback(
+                eval_env,
+                best_model_save_path=f"{self.model_dir}/best_model",
+                log_path=f"{self.model_dir}/eval_results",
+                eval_freq=10000,
+                deterministic=True,
+                render=False,
+            )
+
+            # Train the model
             self.model.learn(
                 total_timesteps=total_timesteps,
                 callback=[wandb_callback, checkpoint_callback, eval_callback],
@@ -406,25 +538,18 @@ class Trader:
             metrics = self.evaluate_performance(eval_data)
             wandb.log({"final_evaluation": metrics})
 
-            # Plot final training results
-            fig = self._plot_trading_actions(
-                eval_data, self.env.trade_history, "Final Training Performance"
-            )
-            wandb.log({"training_plot": wandb.Image(fig)})
-            plt.close(fig)
-
             # Save final model
             final_model_path = os.path.join(self.model_dir, "final_model")
             self.model.save(final_model_path)
             self.logger.info(f"Final model saved to {final_model_path}")
 
-            # Close wandb run
-            wandb.finish()
-
         except Exception as e:
             self.logger.error(f"Error during training: {e}")
-            wandb.finish()
             raise
+
+        finally:
+            # Close wandb run
+            wandb.finish()
 
     def evaluate_performance(self, test_data: pd.DataFrame) -> Dict:
         """Evaluate model performance on test data."""
@@ -433,58 +558,118 @@ class Trader:
 
         try:
             env = self.create_environment(test_data)
-            obs = env.reset()
+            obs, _ = env.reset()  # Unpack observation and info
             done = False
+            truncated = False
             portfolio_values = []
             actions_taken = []
+            trades = []
+            returns = []
 
-            # Add logging to debug observation shape
-            self.logger.info(
-                f"First observation shape: {obs.shape if hasattr(obs, 'shape') else None}"
-            )
+            initial_value = env.balance + env.position_value
+            last_portfolio_value = initial_value
 
-            while not done:
-                # Convert observation to numpy array with consistent shape
-                if isinstance(obs, (list, tuple)):
-                    obs = np.array(obs, dtype=np.float32)
-                if len(obs.shape) == 1:
-                    obs = obs.reshape(1, -1)  # Ensure 2D shape
+            while not done and not truncated:
+                # Process observation
+                if isinstance(obs, tuple):
+                    obs = obs[0]  # Take first element if tuple
 
-                self.logger.info(f"Processed observation shape: {obs.shape}")
+                # Ensure observation is a numpy array with correct shape
+                obs_array = np.array(obs, dtype=np.float32)
+                if len(obs_array.shape) == 1:
+                    obs_array = obs_array.reshape(1, -1)
 
-                action, _ = self.model.predict(obs, deterministic=True)
-                obs, reward, done, info = env.step(action)
-                portfolio_values.append(info["portfolio_value"])
-                actions_taken.append(action)
+                # Get action from model
+                action, _ = self.model.predict(obs_array, deterministic=True)
 
-            # Calculate performance metrics
-            returns = np.diff(portfolio_values) / portfolio_values[:-1]
-            metrics = {
-                "total_return": (portfolio_values[-1] - portfolio_values[0])
-                / portfolio_values[0],
-                "sharpe_ratio": np.mean(returns)
-                / np.std(returns)
-                * np.sqrt(252),  # Annualized
-                "max_drawdown": np.min(
-                    np.minimum.accumulate(portfolio_values)
-                    / np.maximum.accumulate(portfolio_values)
-                    - 1
-                ),
-                "win_rate": np.sum(returns > 0) / len(returns),
-                "total_trades": len([a for a in actions_taken if a != 0]),
-                "final_portfolio_value": portfolio_values[-1],
-                "avg_return_per_trade": (
-                    np.mean(returns[returns != 0])
-                    if len(returns[returns != 0]) > 0
+                # Take step in environment
+                obs, reward, done, truncated, info = env.step(action)
+
+                # Record portfolio value and calculate return
+                current_value = info["portfolio_value"]
+                portfolio_values.append(current_value)
+
+                # Calculate period return
+                period_return = (
+                    (current_value - last_portfolio_value) / last_portfolio_value
+                    if last_portfolio_value != 0
                     else 0
-                ),
-                "volatility": np.std(returns) * np.sqrt(252),  # Annualized
-                "profit_factor": (
-                    abs(np.sum(returns[returns > 0]) / np.sum(returns[returns < 0]))
-                    if np.sum(returns[returns < 0]) != 0
-                    else np.inf
-                ),
-            }
+                )
+                if period_return != 0:  # Only record non-zero returns
+                    returns.append(period_return)
+
+                last_portfolio_value = current_value
+
+                # Record action and trade if any
+                actions_taken.append(action)
+                if action != 0:  # If not hold
+                    trades.append(
+                        {
+                            "action": "buy" if action == 1 else "sell",
+                            "price": test_data.iloc[env.current_step]["close"],
+                            "portfolio_value": current_value,
+                        }
+                    )
+
+            # Calculate metrics safely
+            total_trades = len(trades)
+            if total_trades == 0:
+                self.logger.warning("No trades were executed during evaluation")
+                metrics = {
+                    "total_return": 0.0,
+                    "sharpe_ratio": 0.0,
+                    "max_drawdown": 0.0,
+                    "win_rate": 0.0,
+                    "total_trades": 0,
+                    "final_portfolio_value": (
+                        portfolio_values[-1] if portfolio_values else initial_value
+                    ),
+                    "avg_return_per_trade": 0.0,
+                    "volatility": 0.0,
+                    "profit_factor": 0.0,
+                }
+            else:
+                # Calculate returns and metrics
+                returns = np.array(returns)
+                positive_returns = returns[returns > 0]
+                negative_returns = returns[returns < 0]
+
+                total_positive = (
+                    np.sum(positive_returns) if len(positive_returns) > 0 else 0
+                )
+                total_negative = (
+                    abs(np.sum(negative_returns)) if len(negative_returns) > 0 else 0
+                )
+
+                metrics = {
+                    "total_return": (portfolio_values[-1] - initial_value)
+                    / initial_value,
+                    "sharpe_ratio": (
+                        np.mean(returns) / np.std(returns) * np.sqrt(252)
+                        if len(returns) > 1
+                        else 0
+                    ),
+                    "max_drawdown": self._calculate_max_drawdown(portfolio_values),
+                    "win_rate": (
+                        len(positive_returns) / len(returns) if len(returns) > 0 else 0
+                    ),
+                    "total_trades": total_trades,
+                    "final_portfolio_value": portfolio_values[-1],
+                    "avg_return_per_trade": np.mean(returns) if len(returns) > 0 else 0,
+                    "volatility": (
+                        np.std(returns) * np.sqrt(252) if len(returns) > 1 else 0
+                    ),
+                    "profit_factor": (
+                        total_positive / total_negative if total_negative > 0 else 0
+                    ),
+                }
+
+            # Log detailed metrics
+            self.logger.info(f"Evaluation completed with {total_trades} trades")
+            self.logger.info(
+                f"Final portfolio value: {metrics['final_portfolio_value']:.2f}"
+            )
+            self.logger.info(f"Total return: {metrics['total_return']:.2%}")
 
             # Create and log performance plot
             if wandb.run is not None:
@@ -501,6 +686,22 @@ class Trader:
         except Exception as e:
             self.logger.error(f"Error during evaluation: {e}")
             raise
+
+    def _calculate_max_drawdown(self, portfolio_values: List[float]) -> float:
+        """Calculate the maximum drawdown from a list of portfolio values."""
+        if not portfolio_values:
+            return 0.0
+
+        peak = portfolio_values[0]
+        max_drawdown = 0.0
+
+        for value in portfolio_values:
+            if value > peak:
+                peak = value
+            drawdown = (peak - value) / peak
+            max_drawdown = max(max_drawdown, drawdown)
+
+        return max_drawdown
 
     def create_environment(
         self, data: pd.DataFrame, initial_balance: float = 10000.0
