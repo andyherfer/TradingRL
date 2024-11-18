@@ -1,7 +1,7 @@
 # TradingRL
 
 A cryptocurrency trading system using deep reinforcement learning, designed for automated trading strategies with comprehensive risk management and real-time market analysis.
-
+(Built Using Claude sonnet-3.6 and Cursor, so replicate at your own risk)
 ## Overview
 
 TradingRL is an advanced cryptocurrency trading platform that leverages deep reinforcement learning to make intelligent trading decisions. The system is designed to operate autonomously while maintaining strict risk management protocols.
