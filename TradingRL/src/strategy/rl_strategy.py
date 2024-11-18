@@ -7,41 +7,39 @@ import gymnasium as gym
 from collections import deque
 import wandb
 
-from TradingRL.src.strategy.base_strategy import (
-    BaseStrategy,
-    Signal,
-    SignalType,
-    StrategyState,
-)
+from .base_strategy import BaseStrategy, Signal, SignalType, StrategyState
 from TradingRL.src.core.trader import Trader
-from TradingRL.src.analysis.market_analyzer import MarketRegime
-from TradingRL.src.analysis.event_manager import Event, EventType
+from TradingRL.src.analysis.market_analyzer import MarketAnalyzer, MarketRegime
+from TradingRL.src.analysis.event_manager import EventManager, Event, EventType
+from TradingRL.src.core.risk_manager import RiskManager
+from TradingRL.src.core.portfolio_manager import PortfolioManager
 
 
 class RLStrategy(BaseStrategy):
-    """
-    Reinforcement Learning based trading strategy.
-    Uses the RL model from Trader for decision making.
-    """
+    """Reinforcement Learning based trading strategy."""
 
     def __init__(
         self,
+        name: str,
         trader: Trader,
+        symbols: List[str],
+        event_manager: EventManager,
+        risk_manager: RiskManager,
+        portfolio_manager: PortfolioManager,
+        market_analyzer: MarketAnalyzer,
         feature_window: int = 100,
         confidence_threshold: float = 0.6,
-        *args,
-        **kwargs,
     ):
-        """
-        Initialize RL Strategy.
+        """Initialize RL Strategy."""
+        super().__init__(
+            name=name,
+            symbols=symbols,
+            event_manager=event_manager,
+            risk_manager=risk_manager,
+            portfolio_manager=portfolio_manager,
+            market_analyzer=market_analyzer,
+        )
 
-        Args:
-            trader: Trader instance with trained RL model
-            feature_window: Window size for feature calculation
-            confidence_threshold: Minimum confidence for signal generation
-            *args, **kwargs: Arguments for BaseStrategy
-        """
-        super().__init__(*args, **kwargs)
         self.trader = trader
         self.feature_window = feature_window
         self.confidence_threshold = confidence_threshold

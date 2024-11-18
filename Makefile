@@ -50,7 +50,7 @@ run: ## Run the trading system
 		echo "Virtual environment not activated. Please run: source .venv/bin/activate"; \
 		exit 1; \
 	fi
-	python -m TradingRL.main --config config --env $$ENV --mode $$MODE
+	PYTHONPATH=. python -m TradingRL.main --config config --env="$$ENV" --mode="$$MODE"
 
 help: ## Show help message
 	@echo "Usage: make [target] [env=<environment>] [mode=<mode>]"

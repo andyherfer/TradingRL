@@ -264,22 +264,24 @@ class ConfigManager:
             self.logger.error(f"Error saving configuration: {e}")
             raise
 
-    def get_secret(self, key: str) -> Optional[str]:
-        """
-        Get encrypted secret value.
-
-        Args:
-            key: Secret key
-        """
+    def get_secret(self, key: str) -> str:
+        """Get a secret value from environment variables or secrets file."""
         try:
-            encrypted_value = os.getenv(key)
-            if encrypted_value:
-                return self.cipher.decrypt(encrypted_value.encode()).decode()
-            return None
+            # Try to get from environment first
+            value = os.getenv(key)
+            if value is not None:
+                return value
 
+            # If not in environment, try secrets file
+            if self.secrets and key in self.secrets:
+                return self.secrets[key]
+
+            # Return empty string if not found
+            self.logger.warning(f"Secret {key} not found")
+            return ""
         except Exception as e:
             self.logger.error(f"Error getting secret: {e}")
-            return None
+            return ""
 
     def set_secret(self, key: str, value: str) -> None:
         """

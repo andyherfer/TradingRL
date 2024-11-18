@@ -9,6 +9,7 @@ from typing import Optional
 import yaml
 import signal
 from datetime import datetime
+import traceback
 
 # Import system components
 from TradingRL.src.core.config_manager import ConfigManager, Environment, SystemMode
@@ -30,28 +31,44 @@ class TradingSystem:
     """Main trading system class that coordinates all components."""
 
     def __init__(self, config_path: str, env: str = "development", mode: str = "paper"):
-        """
-        Initialize trading system.
+        """Initialize trading system."""
+        # Create logs directory if it doesn't exist
+        Path("logs").mkdir(exist_ok=True)
 
-        Args:
-            config_path: Path to configuration directory
-            env: Environment type
-            mode: System operation mode
-        """
         self.logger = self._setup_logging()
         self.logger.info("Initializing trading system...")
 
         # Initialize configuration
         self.config_manager = ConfigManager(base_path=config_path, env=env, mode=mode)
 
+        # Get full configuration
+        try:
+            self.config = {
+                "database": self.config_manager.get("database"),
+                "exchange": {
+                    "api_key": self.config_manager.get_secret("EXCHANGE_API_KEY"),
+                    "api_secret": self.config_manager.get_secret("EXCHANGE_API_SECRET"),
+                    **self.config_manager.get("exchange"),
+                },
+                "monitor": self.config_manager.get("monitor"),
+                "risk": self.config_manager.get("risk"),
+                "system": self.config_manager.get("system"),
+                "trader": self.config_manager.get("trader"),
+                "trading": {
+                    **self.config_manager.get("trading"),
+                    "initial_capital": 10000.0,
+                    "symbols": ["BTC/USDT"],
+                },
+            }
+        except Exception as e:
+            self.logger.error(f"Error loading configuration:\n{traceback.format_exc()}")
+            raise
+
         # Initialize components
         self.components = {}
         self.is_running = False
         self.shutdown_requested = False
-
-        # Setup signal handlers
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
+        self.shutdown_event = asyncio.Event()
 
     def _setup_logging(self) -> logging.Logger:
         """Setup system logging."""
@@ -77,89 +94,12 @@ class TradingSystem:
 
         return logger
 
-    async def initialize(self) -> None:
-        """Initialize all system components."""
-        try:
-            self.logger.info("Starting system initialization...")
-
-            # Initialize core components
-            self.components["event_manager"] = EventManager()
-            self.components["database"] = Database(
-                config=self.config_manager.get("database")
-            )
-
-            # Initialize data components
-            self.components["data_fetcher"] = DataFetcher(
-                api_key=self.config_manager.get_secret("EXCHANGE_API_KEY"),
-                api_secret=self.config_manager.get_secret("EXCHANGE_API_SECRET"),
-                symbols=self.config_manager.get("trading.symbols"),
-                timeframes=self.config_manager.get("trading.timeframes"),
-            )
-
-            # Initialize analysis components
-            self.components["market_analyzer"] = MarketAnalyzer(
-                event_manager=self.components["event_manager"]
-            )
-
-            self.components["performance_analyzer"] = PerformanceAnalyzer(
-                initial_capital=self.config_manager.get("trading.initial_capital")
-            )
-
-            # Initialize trading components
-            self.components["risk_manager"] = RiskManager(
-                event_manager=self.components["event_manager"],
-                config=self.config_manager.get("risk"),
-            )
-
-            self.components["order_manager"] = OrderManager(
-                api_key=self.config_manager.get_secret("EXCHANGE_API_KEY"),
-                api_secret=self.config_manager.get_secret("EXCHANGE_API_SECRET"),
-                event_manager=self.components["event_manager"],
-                risk_manager=self.components["risk_manager"],
-            )
-
-            self.components["order_executor"] = OrderExecutor(
-                client=self.components["data_fetcher"].client,
-                event_manager=self.components["event_manager"],
-                order_manager=self.components["order_manager"],
-            )
-
-            self.components["portfolio_manager"] = PortfolioManager(
-                event_manager=self.components["event_manager"],
-                risk_manager=self.components["risk_manager"],
-                order_manager=self.components["order_manager"],
-                initial_capital=self.config_manager.get("trading.initial_capital"),
-            )
-
-            # Initialize trader and strategy
-            self.components["trader"] = Trader(
-                model_dir=self.config_manager.get("trader.model_dir"),
-                tensorboard_log=self.config_manager.get("trader.tensorboard_log"),
-            )
-
-            self.components["strategy"] = RLStrategy(
-                trader=self.components["trader"],
-                symbols=self.config_manager.get("trading.symbols"),
-                event_manager=self.components["event_manager"],
-                risk_manager=self.components["risk_manager"],
-                portfolio_manager=self.components["portfolio_manager"],
-                market_analyzer=self.components["market_analyzer"],
-            )
-
-            # Initialize monitor
-            self.components["monitor"] = SystemMonitor(
-                config=MonitorConfig(
-                    update_interval=self.config_manager.get(
-                        "monitor.update_interval", 1.0
-                    )
-                )
-            )
-
-            self.logger.info("System initialization completed")
-
-        except Exception as e:
-            self.logger.error(f"Error during initialization: {e}")
-            raise
+    def _signal_handler(self, signum, frame):
+        """Handle system signals."""
+        self.logger.info(f"Received signal {signum}")
+        self.shutdown_requested = True
+        if hasattr(self, "shutdown_event"):
+            asyncio.create_task(self.shutdown())
 
     async def start(self) -> None:
         """Start the trading system."""
@@ -186,40 +126,140 @@ class TradingSystem:
             while not self.shutdown_requested:
                 await asyncio.sleep(1)
 
-            await self.shutdown()
-
         except Exception as e:
-            self.logger.error(f"Error starting system: {e}")
+            self.logger.error(f"Error starting system:\n{traceback.format_exc()}")
             await self.shutdown()
             raise
 
+    async def run(self) -> None:
+        """Run the trading system."""
+        try:
+            # Setup signal handlers
+            signal.signal(signal.SIGINT, self._signal_handler)
+            signal.signal(signal.SIGTERM, self._signal_handler)
+
+            # Initialize components
+            await self.initialize()
+
+            # Start the system
+            await self.start()
+
+            # Wait for shutdown signal
+            await self.shutdown_event.wait()
+
+        except Exception as e:
+            self.logger.error(f"Error running system:\n{traceback.format_exc()}")
+            raise
+        finally:
+            await self.shutdown()
+
     async def shutdown(self) -> None:
         """Shutdown the trading system."""
+        if not self.is_running:
+            return
+
         try:
             self.logger.info("Initiating system shutdown...")
             self.is_running = False
 
-            # Close all positions if in live/paper mode
-            if self.config_manager.mode != SystemMode.BACKTEST:
-                await self.components["portfolio_manager"].close_all_positions()
-
             # Stop components in reverse order
-            await self.components["monitor"].stop()
-            await self.components["strategy"].stop()
-            await self.components["event_manager"].stop()
-            await self.components["data_fetcher"].stop()
-            await self.components["database"].close()
+            if "monitor" in self.components:
+                await self.components["monitor"].stop()
+            if "strategy" in self.components:
+                await self.components["strategy"].stop()
+            if "event_manager" in self.components:
+                await self.components["event_manager"].stop()
+            if "data_fetcher" in self.components:
+                await self.components["data_fetcher"].stop()
+            if "database" in self.components:
+                await self.components["database"].close()
 
             self.logger.info("System shutdown completed")
+            self.shutdown_event.set()
 
         except Exception as e:
-            self.logger.error(f"Error during shutdown: {e}")
+            self.logger.error(f"Error during shutdown:\n{traceback.format_exc()}")
             raise
 
-    def _signal_handler(self, signum, frame):
-        """Handle system signals."""
-        self.logger.info(f"Received signal {signum}")
-        self.shutdown_requested = True
+    async def initialize(self) -> None:
+        """Initialize all system components."""
+        try:
+            self.logger.info("Starting system initialization...")
+
+            # Initialize core components
+            self.components["event_manager"] = EventManager()
+            self.components["database"] = Database(config=self.config["database"])
+
+            # Initialize data components
+            self.components["data_fetcher"] = DataFetcher(
+                api_key=self.config["exchange"]["api_key"],
+                api_secret=self.config["exchange"]["api_secret"],
+                symbols=self.config["trading"]["symbols"],
+                timeframes=self.config["trading"]["timeframes"],
+            )
+
+            # Initialize analysis components
+            self.components["market_analyzer"] = MarketAnalyzer(
+                event_manager=self.components["event_manager"]
+            )
+
+            self.components["performance_analyzer"] = PerformanceAnalyzer(
+                initial_capital=self.config["trading"]["initial_capital"]
+            )
+
+            # Initialize trading components
+            self.components["risk_manager"] = RiskManager(config=self.config["risk"])
+
+            self.components["order_manager"] = OrderManager(
+                api_key=self.config["exchange"]["api_key"],
+                api_secret=self.config["exchange"]["api_secret"],
+                event_manager=self.components["event_manager"],
+                risk_manager=self.components["risk_manager"],
+            )
+
+            self.components["order_executor"] = OrderExecutor(
+                client=self.components["data_fetcher"].client,
+                event_manager=self.components["event_manager"],
+                order_manager=self.components["order_manager"],
+            )
+
+            self.components["portfolio_manager"] = PortfolioManager(
+                event_manager=self.components["event_manager"],
+                risk_manager=self.components["risk_manager"],
+                order_manager=self.components["order_manager"],
+                initial_capital=self.config["trading"]["initial_capital"],
+            )
+
+            # Initialize trader and strategy
+            self.components["trader"] = Trader(
+                model_dir=self.config["trader"]["model_dir"],
+                tensorboard_log=self.config["trader"]["tensorboard_log"],
+            )
+
+            self.components["strategy"] = RLStrategy(
+                name="rl_strategy",
+                trader=self.components["trader"],
+                symbols=self.config["trading"]["symbols"],
+                event_manager=self.components["event_manager"],
+                risk_manager=self.components["risk_manager"],
+                portfolio_manager=self.components["portfolio_manager"],
+                market_analyzer=self.components["market_analyzer"],
+            )
+
+            # Initialize monitor
+            self.components["monitor"] = SystemMonitor(
+                config=MonitorConfig(
+                    update_interval=self.config["monitor"]["update_interval"]
+                )
+            )
+
+            self.logger.info("System initialization completed")
+
+        except Exception as e:
+            self.logger.error(f"Error during initialization:\n{traceback.format_exc()}")
+            raise
+
+    # ... (rest of the implementation remains the same)
 
 
 @click.command()
@@ -234,41 +274,14 @@ def main(config: str, env: str, mode: str):
         # Initialize and start the system
         system = TradingSystem(config, env, mode)
 
-        # Run the system
+        # Run the system using asyncio
         asyncio.run(system.run())
 
+    except KeyboardInterrupt:
+        logging.info("Received keyboard interrupt, shutting down...")
     except Exception as e:
-        logging.error(f"System error: {e}")
+        logging.error(f"System error:\n{traceback.format_exc()}")
         sys.exit(1)
-
-
-async def run_backtest(
-    config_path: str, start_date: datetime, end_date: datetime
-) -> None:
-    """Run system in backtest mode."""
-    try:
-        # Initialize system
-        system = TradingSystem(
-            config_path=config_path, env="development", mode="backtest"
-        )
-
-        # Initialize components
-        await system.initialize()
-
-        # Load historical data
-        data = await system.components["data_fetcher"].get_historical_data(
-            start_date=start_date, end_date=end_date
-        )
-
-        # Run backtest
-        results = await system.components["strategy"].backtest(data)
-
-        # Generate and save results
-        await system.components["performance_analyzer"].analyze_backtest(results)
-
-    except Exception as e:
-        logging.error(f"Backtest error: {e}")
-        raise
 
 
 if __name__ == "__main__":

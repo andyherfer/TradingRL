@@ -12,10 +12,10 @@ import wandb
 import talib
 from scipy import stats
 
-from .event_manager import EventManager, Event, EventType, EventPriority
-from .risk_manager import RiskManager
-from .portfolio_manager import PortfolioManager
-from .market_analyzer import MarketAnalyzer, MarketRegime
+from ..analysis.event_manager import EventManager, Event, EventType, EventPriority
+from ..core.risk_manager import RiskManager
+from ..core.portfolio_manager import PortfolioManager
+from ..analysis.market_analyzer import MarketAnalyzer, MarketRegime
 
 
 class SignalType(Enum):

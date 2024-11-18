@@ -7,14 +7,19 @@ from enum import Enum
 import logging
 import asyncio
 import time
-from collections import deque
-import json
+from collections import defaultdict
 import wandb
+import matplotlib.pyplot as plt
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 
-from ..analysis.event_manager import EventManager, Event, EventType, EventPriority
-from .order_manager import OrderManager, OrderType, OrderSide, Order
+from TradingRL.src.analysis.event_manager import (
+    EventManager,
+    Event,
+    EventType,
+    EventPriority,
+)
+from TradingRL.src.core.order_manager import OrderManager, OrderType, OrderSide, Order
 
 
 class ExecutionAlgo(Enum):
@@ -127,6 +132,49 @@ class OrderExecutor:
             [EventType.PRICE_UPDATE, EventType.LIQUIDITY_UPDATE],
             EventPriority.HIGH,
         )
+
+    async def _handle_market_update(self, event: Event) -> None:
+        """Handle market data updates."""
+        try:
+            if event.type == EventType.PRICE_UPDATE:
+                symbol = event.data["symbol"]
+                price = event.data["price"]
+
+                # Update market data cache
+                if symbol not in self.market_data_cache:
+                    self.market_data_cache[symbol] = {}
+                self.market_data_cache[symbol]["last_price"] = price
+
+                # Update active executions if any
+                if symbol in self.active_executions:
+                    await self._update_execution_strategy(symbol, price)
+
+            elif event.type == EventType.LIQUIDITY_UPDATE:
+                symbol = event.data["symbol"]
+                liquidity = event.data["liquidity"]
+
+                # Update market data cache
+                if symbol not in self.market_data_cache:
+                    self.market_data_cache[symbol] = {}
+                self.market_data_cache[symbol]["liquidity"] = liquidity
+
+        except Exception as e:
+            self.logger.error(f"Error handling market update: {e}")
+
+    async def _update_execution_strategy(self, symbol: str, price: float) -> None:
+        """Update execution strategy based on new market data."""
+        try:
+            execution = self.active_executions[symbol]
+
+            # Update execution metrics
+            execution.metrics["price_trajectory"].append(price)
+
+            # Adjust execution strategy if needed
+            if execution.params.algo == ExecutionAlgo.ADAPTIVE:
+                await self._adjust_adaptive_execution(symbol, price)
+
+        except Exception as e:
+            self.logger.error(f"Error updating execution strategy: {e}")
 
     async def execute_order(
         self, order: Order, params: ExecutionParams

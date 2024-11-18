@@ -13,8 +13,13 @@ import wandb
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 
-from ..analysis.event_manager import EventManager, Event, EventType, EventPriority
-from .risk_manager import RiskManager
+from TradingRL.src.analysis.event_manager import (
+    EventManager,
+    Event,
+    EventType,
+    EventPriority,
+)
+from TradingRL.src.core.risk_manager import RiskManager
 
 
 class OrderStatus(Enum):
