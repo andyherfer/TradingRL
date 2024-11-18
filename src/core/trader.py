@@ -436,6 +436,238 @@ def get_device() -> str:
     return "cpu"
 
 
+class CustomTrainingCallback(BaseCallback):
+    """Custom callback for detailed training monitoring."""
+
+    def __init__(self, eval_env, eval_freq: int = 1000, verbose: int = 1):
+        super().__init__(verbose)
+        self.eval_env = eval_env
+        self.eval_freq = eval_freq
+        self.best_mean_reward = -np.inf
+        self.last_eval_step = 0
+
+        # Initialize training metrics tracking
+        self.training_rewards = []
+        self.episode_lengths = []
+        self.losses = {"policy_loss": [], "value_loss": [], "entropy_loss": []}
+        self.current_episode_reward = 0
+        self.current_episode_length = 0
+
+    def _on_step(self) -> bool:
+        """Called after each step in training."""
+        # Track episode progress
+        self.current_episode_length += 1
+        self.current_episode_reward += self.locals["rewards"][0]
+
+        # Log training metrics
+        if self.locals.get("dones")[0]:
+            # Episode finished
+            self.training_rewards.append(self.current_episode_reward)
+            self.episode_lengths.append(self.current_episode_length)
+
+            # Log episode metrics
+            wandb.log(
+                {
+                    "train/episode_reward": self.current_episode_reward,
+                    "train/episode_length": self.current_episode_length,
+                },
+                step=self.num_timesteps,
+            )
+
+            # Reset episode tracking
+            self.current_episode_reward = 0
+            self.current_episode_length = 0
+
+        # Log training losses if available
+        if "train" in self.locals:
+            train_info = self.locals["train"]
+            if train_info is not None:
+                wandb.log(
+                    {
+                        "train/policy_loss": train_info.get("policy_loss", 0),
+                        "train/value_loss": train_info.get("value_loss", 0),
+                        "train/entropy_loss": train_info.get("entropy_loss", 0),
+                        "train/learning_rate": self.locals["learning_rate"],
+                        "train/clip_range": self.locals["clip_range"],
+                        "train/clip_fraction": train_info.get("clip_fraction", 0),
+                        "train/approx_kl": train_info.get("approx_kl", 0),
+                        "train/explained_variance": train_info.get(
+                            "explained_variance", 0
+                        ),
+                    },
+                    step=self.num_timesteps,
+                )
+
+        # Periodic evaluation
+        if self.n_calls - self.last_eval_step >= self.eval_freq:
+            self.last_eval_step = self.n_calls
+
+            # Run evaluation rollout
+            episode_rewards = []
+            episode_lengths = []
+            portfolio_values = []
+            trades_info = []
+
+            obs, _ = self.eval_env.reset()
+            done = False
+            truncated = False
+
+            while not done and not truncated:
+                action, _ = self.model.predict(obs, deterministic=True)
+                obs, reward, done, truncated, info = self.eval_env.step(action)
+
+                episode_rewards.append(reward)
+                portfolio_values.append(info["portfolio_value"])
+
+                if "trade_history" in info and info["trade_history"]:
+                    trades_info.extend(info["trade_history"])
+
+            # Calculate metrics
+            total_return = (
+                portfolio_values[-1] - portfolio_values[0]
+            ) / portfolio_values[0]
+
+            # Calculate buy & hold return using raw data
+            initial_price = self.eval_env.raw_data["close"].iloc[0]
+            final_price = self.eval_env.raw_data["close"].iloc[-1]
+            buy_hold_return = (final_price - initial_price) / initial_price
+
+            # Calculate trading metrics
+            if trades_info:
+                win_rate = len([t for t in trades_info if t.profit_loss > 0]) / len(
+                    trades_info
+                )
+                avg_profit_per_trade = np.mean([t.profit_loss for t in trades_info])
+                max_drawdown = self._calculate_max_drawdown(portfolio_values)
+
+                # Calculate Sharpe ratio
+                returns = np.diff(portfolio_values) / portfolio_values[:-1]
+                sharpe_ratio = (
+                    np.mean(returns) / np.std(returns) * np.sqrt(252)
+                    if len(returns) > 1
+                    else 0
+                )
+
+                # Calculate average trade duration
+                if len(trades_info) >= 2:
+                    trade_durations = []
+                    for i in range(0, len(trades_info) - 1, 2):  # Pair buy/sell trades
+                        if trades_info[i].action == "buy" and i + 1 < len(trades_info):
+                            duration = (
+                                trades_info[i + 1].timestamp - trades_info[i].timestamp
+                            )
+                            trade_durations.append(
+                                duration.total_seconds() / 3600
+                            )  # Convert to hours
+                    avg_trade_duration = (
+                        np.mean(trade_durations) if trade_durations else 0
+                    )
+                else:
+                    avg_trade_duration = 0
+
+                # Create evaluation plots
+                price_plot = self._create_price_plot(
+                    self.eval_env.raw_data["close"], trades_info
+                )
+                portfolio_plot = self._create_portfolio_plot(portfolio_values)
+                returns_plot = self._create_returns_plot(returns)
+
+                # Log metrics and plots to wandb
+                wandb.log(
+                    {
+                        "eval/total_return": total_return,
+                        "eval/buy_hold_return": buy_hold_return,
+                        "eval/relative_return": total_return - buy_hold_return,
+                        "eval/win_rate": win_rate,
+                        "eval/avg_profit_per_trade": avg_profit_per_trade,
+                        "eval/max_drawdown": max_drawdown,
+                        "eval/sharpe_ratio": sharpe_ratio,
+                        "eval/avg_trade_duration": avg_trade_duration,
+                        "eval/num_trades": len(trades_info) // 2,
+                        "eval/portfolio_value": portfolio_values[-1],
+                        "eval/mean_reward": np.mean(episode_rewards),
+                        "eval/price_plot": wandb.Image(price_plot),
+                        "eval/portfolio_plot": wandb.Image(portfolio_plot),
+                        "eval/returns_plot": wandb.Image(returns_plot),
+                    },
+                    step=self.num_timesteps,
+                )
+
+                plt.close("all")
+
+        return True
+
+    def _create_price_plot(self, prices, trades):
+        """Create price plot with buy/sell markers."""
+        fig, ax = plt.subplots(figsize=(12, 6))
+        ax.plot(prices.index, prices.values, label="Price", alpha=0.7)
+
+        # Add buy/sell markers
+        buy_trades = [t for t in trades if t.action == "buy"]
+        sell_trades = [t for t in trades if t.action == "sell"]
+
+        if buy_trades:
+            ax.scatter(
+                [t.timestamp for t in buy_trades],
+                [t.price for t in buy_trades],
+                marker="^",
+                color="green",
+                s=100,
+                label="Buy",
+            )
+
+        if sell_trades:
+            ax.scatter(
+                [t.timestamp for t in sell_trades],
+                [t.price for t in sell_trades],
+                marker="v",
+                color="red",
+                s=100,
+                label="Sell",
+            )
+
+        ax.set_title("Price and Trading Actions")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        return fig
+
+    def _create_portfolio_plot(self, portfolio_values):
+        """Create portfolio value plot."""
+        fig, ax = plt.subplots(figsize=(12, 6))
+        ax.plot(range(len(portfolio_values)), portfolio_values, label="Portfolio Value")
+        ax.set_title("Portfolio Value Over Time")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        return fig
+
+    def _create_returns_plot(self, returns):
+        """Create returns distribution plot."""
+        fig, ax = plt.subplots(figsize=(12, 6))
+        sns.histplot(returns, bins=50, ax=ax)
+        ax.set_title("Returns Distribution")
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        return fig
+
+    def _calculate_max_drawdown(self, portfolio_values: List[float]) -> float:
+        """Calculate the maximum drawdown from a list of portfolio values."""
+        if not portfolio_values:
+            return 0.0
+
+        peak = portfolio_values[0]
+        max_drawdown = 0.0
+
+        for value in portfolio_values:
+            if value > peak:
+                peak = value
+            drawdown = (peak - value) / peak
+            max_drawdown = max(max_drawdown, drawdown)
+
+        return max_drawdown
+
+
 class Trader:
     """Main trader class for managing the RL model and trading decisions."""
 
@@ -478,6 +710,8 @@ class Trader:
                     "model_type": "PPO",
                     "total_timesteps": total_timesteps,
                     "device": self.device,
+                    "train_data_size": len(train_data),
+                    "eval_data_size": len(eval_data),
                     **(hyperparams or {}),
                 },
             )
@@ -512,31 +746,23 @@ class Trader:
             )
 
             # Setup callbacks
-            wandb_callback = WandBCallback(check_freq=1000)
-
-            checkpoint_callback = CheckpointCallback(
-                save_freq=10000, save_path=self.model_dir, name_prefix="ppo_trader"
+            custom_callback = CustomTrainingCallback(
+                eval_env=eval_env,
+                eval_freq=1000,  # Evaluate every 1000 steps
             )
 
-            eval_callback = EvalCallback(
-                eval_env,
-                best_model_save_path=f"{self.model_dir}/best_model",
-                log_path=f"{self.model_dir}/eval_results",
-                eval_freq=10000,
-                deterministic=True,
-                render=False,
+            checkpoint_callback = CheckpointCallback(
+                save_freq=10000,
+                save_path=self.model_dir,
+                name_prefix="ppo_trader",
             )
 
             # Train the model
             self.model.learn(
                 total_timesteps=total_timesteps,
-                callback=[wandb_callback, checkpoint_callback, eval_callback],
+                callback=[custom_callback, checkpoint_callback],
                 tb_log_name=f"ppo_trader_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
             )
-
-            # Evaluate final performance
-            metrics = self.evaluate_performance(eval_data)
-            wandb.log({"final_evaluation": metrics})
 
             # Save final model
             final_model_path = os.path.join(self.model_dir, "final_model")
