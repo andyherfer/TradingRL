@@ -6,13 +6,10 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-# Add parent directory to path to import our modules
-sys.path.append(str(Path(__file__).parent.parent))
-
-from src.core.config_manager import ConfigManager, Environment, SystemMode
-from src.data.data_fetcher import DataFetcher
-from src.core.trader import Trader
-from src.analysis.market_analyzer import MarketAnalyzer
+from TradingRL.src.core.config_manager import ConfigManager, Environment, SystemMode
+from TradingRL.src.data.data_fetcher import DataFetcher
+from TradingRL.src.core.trader import Trader
+from TradingRL.src.analysis.market_analyzer import MarketAnalyzer
 
 
 async def train_model(config_path: str, symbol: str, device: Optional[str] = None):

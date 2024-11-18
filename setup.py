@@ -1,0 +1,31 @@
+from setuptools import setup, find_packages
+
+setup(
+    name="TradingRL",
+    version="0.1.0",
+    packages=find_packages(),
+    install_requires=[
+        "pandas>=2.2.3",
+        "numpy>=1.26.0",
+        "PyYAML>=6.0.1",
+        "python-dotenv>=1.0.0",
+        "click>=8.1.7",
+        "pydantic>=2.3.0",
+        "torch>=2.2.2",
+        "gymnasium>=0.29.1",
+        "stable-baselines3>=2.1.0",
+        "scikit-learn>=1.3.0",
+        "pandas-ta>=0.3.14b",
+        "TA-Lib",
+        "python-binance>=1.0.19",
+        "ccxt>=4.4.24",
+        "aiosqlite>=0.19.0",
+        "asyncpg>=0.28.0",
+        "wandb",
+        "tensorboard>=2.14.0",
+        "matplotlib>=3.7.2",
+        "seaborn>=0.12.2",
+        "cryptography>=41.0.3",
+    ],
+    python_requires=">=3.9",
+)

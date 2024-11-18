@@ -7,10 +7,15 @@ import gymnasium as gym
 from collections import deque
 import wandb
 
-from .strategy import BaseStrategy, Signal, SignalType, StrategyState
-from .trader import Trader
-from .market_analyzer import MarketRegime
-from .event_manager import Event, EventType
+from TradingRL.src.strategy.base_strategy import (
+    BaseStrategy,
+    Signal,
+    SignalType,
+    StrategyState,
+)
+from TradingRL.src.core.trader import Trader
+from TradingRL.src.analysis.market_analyzer import MarketRegime
+from TradingRL.src.analysis.event_manager import Event, EventType
 
 
 class RLStrategy(BaseStrategy):
