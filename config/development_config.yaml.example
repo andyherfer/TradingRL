@@ -1,0 +1,60 @@
+system:
+  environment: development
+  mode: paper
+  log_level: info
+  data_dir: data
+  models_dir: models/development
+  enable_wandb: true
+  debug_mode: true
+
+exchange:
+  name: binance
+  testnet: true
+  rate_limit: 1200
+  timeout: 30
+
+database:
+  type: sqlite
+  path: data/trading.db
+
+trading:
+  symbols:
+    - BTC/USDT
+    - ETH/USDT
+  timeframes:
+    - 1m
+    - 5m
+    - 15m
+    - 1h
+  max_positions: 3
+  initial_capital: 400
+
+risk:
+  max_position_size: 0.1
+  max_drawdown: 0.2
+  stop_loss: 0.05
+  take_profit: 0.1
+
+trader:
+  model_dir: models/development
+  tensorboard_log: logs/tensorboard
+  training:
+    data_window: "30d"  # Amount of historical data to use
+    batch_size: 64
+    learning_rate: 0.0003
+    train_test_split: 0.8
+    epochs: 100
+    save_frequency: 10
+    validation_interval: 10
+    early_stopping_patience: 5
+    model_params:
+      n_steps: 2048
+      ent_coef: 0.01
+      n_epochs: 10
+      gamma: 0.99
+
+monitor:
+  update_interval: 1.0
+  max_log_lines: 1000
+  history_size: 3600
+  save_interval: 300
