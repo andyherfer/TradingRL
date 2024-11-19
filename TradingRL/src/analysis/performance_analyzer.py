@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 import pandas as pd
 import numpy as np
 from datetime import datetime
@@ -25,7 +25,7 @@ class PerformanceMetrics:
 
 
 class PerformanceAnalyzer:
-    """Analyzes trading performance without pyfolio dependency."""
+    """Analyzes trading performance."""
 
     def __init__(self, initial_capital: float = 10000.0):
         """Initialize the analyzer."""
@@ -33,116 +33,68 @@ class PerformanceAnalyzer:
         self.logger = logging.getLogger(__name__)
         self.metrics_history: List[PerformanceMetrics] = []
 
-    def calculate_metrics(
-        self, returns: pd.Series, trades: pd.DataFrame
-    ) -> PerformanceMetrics:
-        """Calculate performance metrics from returns and trades."""
+    async def analyze_performance(
+        self, portfolio_history: pd.DataFrame, trades: pd.DataFrame
+    ) -> Dict[str, Any]:
+        """Analyze trading performance."""
         try:
-            # Basic return metrics
-            total_return = (1 + returns).prod() - 1
-            volatility = returns.std() * np.sqrt(252)  # Annualized
-            sharpe_ratio = (
-                np.sqrt(252) * returns.mean() / returns.std()
-                if returns.std() != 0
-                else 0
-            )
+            # Calculate returns
+            returns = portfolio_history["portfolio_value"].pct_change().dropna()
 
-            # Maximum drawdown
-            cum_returns = (1 + returns).cumprod()
-            rolling_max = cum_returns.expanding().max()
-            drawdowns = cum_returns / rolling_max - 1
-            max_drawdown = drawdowns.min()
-
-            # Trade metrics
-            if not trades.empty:
-                winning_trades = trades[trades["pnl"] > 0]
-                win_rate = len(winning_trades) / len(trades)
-
-                total_profits = trades[trades["pnl"] > 0]["pnl"].sum()
-                total_losses = abs(trades[trades["pnl"] < 0]["pnl"].sum())
-                profit_factor = (
-                    total_profits / total_losses if total_losses != 0 else float("inf")
+            # Calculate metrics
+            metrics = {
+                "total_return": (
+                    portfolio_history["portfolio_value"].iloc[-1] / self.initial_capital
                 )
+                - 1,
+                "sharpe_ratio": self._calculate_sharpe_ratio(returns),
+                "max_drawdown": self._calculate_max_drawdown(
+                    portfolio_history["portfolio_value"]
+                ),
+                "win_rate": self._calculate_win_rate(trades),
+                "profit_factor": self._calculate_profit_factor(trades),
+                "avg_trade_return": trades["pnl"].mean() if not trades.empty else 0,
+                "volatility": returns.std() * np.sqrt(252),  # Annualized
+                "trades_count": len(trades),
+            }
 
-                avg_trade_return = trades["pnl"].mean()
-                trades_count = len(trades)
-            else:
-                win_rate = 0.0
-                profit_factor = 0.0
-                avg_trade_return = 0.0
-                trades_count = 0
+            # Create performance metrics object
+            perf_metrics = PerformanceMetrics(timestamp=datetime.now(), **metrics)
+            self.metrics_history.append(perf_metrics)
 
-            metrics = PerformanceMetrics(
-                total_return=total_return,
-                sharpe_ratio=sharpe_ratio,
-                max_drawdown=max_drawdown,
-                win_rate=win_rate,
-                profit_factor=profit_factor,
-                avg_trade_return=avg_trade_return,
-                volatility=volatility,
-                trades_count=trades_count,
-                timestamp=datetime.now(),
-            )
+            # Log to wandb if available
+            if wandb.run is not None:
+                wandb.log({f"performance/{k}": v for k, v in metrics.items()})
 
-            self.metrics_history.append(metrics)
             return metrics
 
         except Exception as e:
-            self.logger.error(f"Error calculating performance metrics: {e}")
+            self.logger.error(f"Error analyzing performance: {e}")
             raise
 
-    def plot_performance(
-        self, returns: pd.Series, trades: pd.DataFrame
-    ) -> Dict[str, plt.Figure]:
-        """Create performance visualization plots."""
-        try:
-            plots = {}
+    def _calculate_sharpe_ratio(self, returns: pd.Series) -> float:
+        """Calculate Sharpe ratio."""
+        if returns.empty or returns.std() == 0:
+            return 0
+        return np.sqrt(252) * (returns.mean() / returns.std())
 
-            # Cumulative returns plot
-            fig_returns, ax = plt.subplots(figsize=(12, 6))
-            cum_returns = (1 + returns).cumprod()
-            cum_returns.plot(ax=ax)
-            ax.set_title("Cumulative Returns")
-            ax.grid(True)
-            plots["cumulative_returns"] = fig_returns
+    def _calculate_max_drawdown(self, portfolio_values: pd.Series) -> float:
+        """Calculate maximum drawdown."""
+        peak = portfolio_values.expanding(min_periods=1).max()
+        drawdown = (portfolio_values - peak) / peak
+        return drawdown.min()
 
-            # Drawdown plot
-            fig_dd, ax = plt.subplots(figsize=(12, 6))
-            rolling_max = cum_returns.expanding().max()
-            drawdowns = cum_returns / rolling_max - 1
-            drawdowns.plot(ax=ax)
-            ax.set_title("Drawdowns")
-            ax.grid(True)
-            plots["drawdowns"] = fig_dd
+    def _calculate_win_rate(self, trades: pd.DataFrame) -> float:
+        """Calculate win rate."""
+        if trades.empty:
+            return 0
+        winning_trades = len(trades[trades["pnl"] > 0])
+        return winning_trades / len(trades)
 
-            if not trades.empty:
-                # Trade returns distribution
-                fig_dist, ax = plt.subplots(figsize=(12, 6))
-                sns.histplot(trades["pnl"], ax=ax)
-                ax.set_title("Trade Returns Distribution")
-                plots["trade_distribution"] = fig_dist
-
-            return plots
-
-        except Exception as e:
-            self.logger.error(f"Error creating performance plots: {e}")
-            raise
-
-    def log_metrics(self, metrics: PerformanceMetrics) -> None:
-        """Log metrics to wandb if available."""
-        try:
-            if wandb.run is not None:
-                wandb.log(
-                    {
-                        "performance/total_return": metrics.total_return,
-                        "performance/sharpe_ratio": metrics.sharpe_ratio,
-                        "performance/max_drawdown": metrics.max_drawdown,
-                        "performance/win_rate": metrics.win_rate,
-                        "performance/profit_factor": metrics.profit_factor,
-                        "performance/avg_trade_return": metrics.avg_trade_return,
-                        "performance/volatility": metrics.volatility,
-                        "performance/trades_count": metrics.trades_count,
-                    }
-                )
-        except Exception as e:
-            self.logger.error(f"Error logging metrics: {e}")
+    def _calculate_profit_factor(self, trades: pd.DataFrame) -> float:
+        """Calculate profit factor."""
+        if trades.empty:
+            return 0
+        profits = trades[trades["pnl"] > 0]["pnl"].sum()
+        losses = abs(trades[trades["pnl"] < 0]["pnl"].sum())
+        return profits / losses if losses != 0 else float("inf")

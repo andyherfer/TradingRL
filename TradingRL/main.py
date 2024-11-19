@@ -5,11 +5,13 @@ import click
 import logging
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, List
 import yaml
 import signal
 from datetime import datetime
 import traceback
+from enum import Enum
+from dataclasses import dataclass
 
 # Import system components
 from TradingRL.src.core.config_manager import ConfigManager, Environment, SystemMode
@@ -25,6 +27,25 @@ from TradingRL.src.strategy.rl_strategy import RLStrategy
 from TradingRL.src.analysis.market_analyzer import MarketAnalyzer
 from TradingRL.src.analysis.performance_analyzer import PerformanceAnalyzer
 from TradingRL.src.monitoring.system_monitor import SystemMonitor, MonitorConfig
+
+
+class ComponentStatus(Enum):
+    """Component status enumeration."""
+
+    OK = "ok"
+    ERROR = "error"
+    NOT_INITIALIZED = "not_initialized"
+    DEPENDENCY_MISSING = "dependency_missing"
+
+
+@dataclass
+class ComponentCheck:
+    """Component check result."""
+
+    status: ComponentStatus
+    message: str
+    dependencies: List[str]
+    required_methods: List[str]
 
 
 class TradingSystem:
@@ -140,6 +161,11 @@ class TradingSystem:
 
             # Initialize components
             await self.initialize()
+
+            # Check system integrity
+            check_results = await self.check_system_integrity()
+            if any(r.status != ComponentStatus.OK for r in check_results.values()):
+                raise RuntimeError("System integrity check failed")
 
             # Start the system
             await self.start()
@@ -259,7 +285,122 @@ class TradingSystem:
             self.logger.error(f"Error during initialization:\n{traceback.format_exc()}")
             raise
 
-    # ... (rest of the implementation remains the same)
+    async def check_system_integrity(self) -> Dict[str, ComponentCheck]:
+        """Check integrity of all system components."""
+        self.logger.info("Checking system integrity...")
+
+        # Define required components and their dependencies
+        component_requirements = {
+            "database": {
+                "dependencies": [],
+                "methods": ["initialize", "close"],
+            },
+            "event_manager": {
+                "dependencies": [],
+                "methods": ["start", "stop", "publish", "subscribe"],
+            },
+            "data_fetcher": {
+                "dependencies": [],
+                "methods": ["start", "stop"],
+            },
+            "market_analyzer": {
+                "dependencies": ["event_manager"],
+                "methods": ["analyze_market_state"],
+            },
+            "performance_analyzer": {
+                "dependencies": [],
+                "methods": ["analyze_performance"],
+            },
+            "risk_manager": {
+                "dependencies": [],
+                "methods": ["check_risk_limits", "calculate_position_size"],
+            },
+            "order_manager": {
+                "dependencies": ["event_manager", "risk_manager"],
+                "methods": ["create_order", "cancel_order"],
+            },
+            "order_executor": {
+                "dependencies": ["event_manager", "order_manager"],
+                "methods": ["execute_order"],
+            },
+            "portfolio_manager": {
+                "dependencies": ["event_manager", "risk_manager", "order_manager"],
+                "methods": ["get_total_value", "close_all_positions"],
+            },
+            "trader": {
+                "dependencies": [],
+                "methods": ["train_model", "predict_action"],
+            },
+            "strategy": {
+                "dependencies": [
+                    "event_manager",
+                    "risk_manager",
+                    "portfolio_manager",
+                    "market_analyzer",
+                    "trader",
+                ],
+                "methods": ["start", "stop", "generate_signals"],
+            },
+            "monitor": {
+                "dependencies": [],
+                "methods": ["start", "stop"],
+            },
+        }
+
+        results = {}
+
+        # Check each component
+        for component_name, requirements in component_requirements.items():
+            if component_name not in self.components:
+                results[component_name] = ComponentCheck(
+                    status=ComponentStatus.NOT_INITIALIZED,
+                    message=f"Component {component_name} is not initialized",
+                    dependencies=requirements["dependencies"],
+                    required_methods=requirements["methods"],
+                )
+                continue
+
+            component = self.components[component_name]
+            missing_methods = []
+            missing_deps = []
+
+            # Check required methods
+            for method in requirements["methods"]:
+                if not hasattr(component, method):
+                    missing_methods.append(method)
+
+            # Check dependencies
+            for dep in requirements["dependencies"]:
+                if dep not in self.components:
+                    missing_deps.append(dep)
+
+            if missing_methods or missing_deps:
+                status = ComponentStatus.ERROR
+                message = []
+                if missing_methods:
+                    message.append(f"Missing methods: {', '.join(missing_methods)}")
+                if missing_deps:
+                    message.append(f"Missing dependencies: {', '.join(missing_deps)}")
+                results[component_name] = ComponentCheck(
+                    status=status,
+                    message="; ".join(message),
+                    dependencies=requirements["dependencies"],
+                    required_methods=requirements["methods"],
+                )
+            else:
+                results[component_name] = ComponentCheck(
+                    status=ComponentStatus.OK,
+                    message="All checks passed",
+                    dependencies=requirements["dependencies"],
+                    required_methods=requirements["methods"],
+                )
+
+        # Log results
+        self.logger.info("System integrity check results:")
+        for component, check in results.items():
+            self.logger.info(f"{component}: {check.status.value} - {check.message}")
+
+        return results
 
 
 @click.command()
