@@ -304,15 +304,32 @@ class TradingEnvironment(gym.Env):
         current_price = float(self.raw_data.iloc[self.current_step]["close"])
         old_portfolio_value = self.balance + self.position_value
 
+        # Constants for reward calculation
+        MAKER_FEE = 0.001  # 0.10% maker fee
+        TAKER_FEE = 0.001  # 0.10% taker fee
+        ASYMMETRIC_LOSS_MULTIPLIER = 1.3  # Multiply losses by 2
+
+        reward = 0
+        trade_cost = 0
+
+        # Calculate price movement for this step
+        prev_price = (
+            float(self.raw_data.iloc[self.current_step - 1]["close"])
+            if self.current_step > 0
+            else current_price
+        )
+        price_change_pct = (
+            (current_price - prev_price) / prev_price if prev_price > 0 else 0
+        )
+
         # Execute trading action
         if action == 1:  # Buy
             if self.balance > 0:
                 purchase_amount = self.balance * 0.95  # Keep some balance for fees
-                new_position = (
-                    purchase_amount * (1 - self.commission_rate)
-                ) / current_price
+                trade_cost = purchase_amount * TAKER_FEE
+                new_position = (purchase_amount - trade_cost) / current_price
                 self.position += new_position
-                self.balance -= purchase_amount
+                self.balance -= purchase_amount + trade_cost
 
                 # Record trade
                 self.trade_history.append(
@@ -328,13 +345,16 @@ class TradingEnvironment(gym.Env):
 
         elif action == 2:  # Sell
             if self.position > 0:
-                sale_amount = self.position * current_price * (1 - self.commission_rate)
-                profit_loss = sale_amount - (
-                    self.position * self.trade_history[-1].price
-                    if self.trade_history
-                    else 0
-                )
-                self.balance += sale_amount
+                sale_amount = self.position * current_price
+                trade_cost = sale_amount * TAKER_FEE
+                net_sale_amount = sale_amount - trade_cost
+
+                # Calculate profit/loss
+                last_trade = self.trade_history[-1] if self.trade_history else None
+                entry_price = last_trade.price if last_trade else current_price
+                profit_loss = net_sale_amount - (self.position * entry_price)
+
+                self.balance += net_sale_amount
 
                 # Record trade
                 self.trade_history.append(
@@ -353,16 +373,46 @@ class TradingEnvironment(gym.Env):
         # Update position value
         self.position_value = self.position * current_price
 
-        # Calculate reward
+        # Calculate new portfolio value and return
         new_portfolio_value = self.balance + self.position_value
-        reward = (new_portfolio_value - old_portfolio_value) / old_portfolio_value
+        value_change = new_portfolio_value - old_portfolio_value
+
+        # Calculate percentage return
+        pct_return = (
+            value_change / old_portfolio_value if old_portfolio_value > 0 else 0
+        )
+
+        # Calculate reward components
+        if action == 0:  # Hold
+            # Inverse reward for inaction based on price movement
+            # If price goes up, penalize for missing opportunity
+            # If price goes down, reward for avoiding loss
+            reward = -price_change_pct  # Inverse of the market movement
+
+            # Scale the reward based on whether we have a position
+            if self.position > 0:
+                # If we're holding a position, align reward with price movement
+                reward = price_change_pct
+            else:
+                # If we have no position, inverse reward (penalize missed gains, reward avoided losses)
+                reward = -price_change_pct
+
+        else:
+            # For trades, use asymmetric reward based on return
+            if pct_return > 0:
+                reward = pct_return
+            else:
+                reward = pct_return * ASYMMETRIC_LOSS_MULTIPLIER
+
+            # Subtract trading costs from reward
+            reward -= trade_cost / old_portfolio_value
 
         # Move to next step
         self.current_step += 1
 
         # Check if episode is finished
         terminated = self.current_step >= len(self.data) - 1
-        truncated = False  # We don't use truncation in this environment
+        truncated = False
 
         # Get new observation
         obs = self._get_observation()
@@ -374,6 +424,11 @@ class TradingEnvironment(gym.Env):
             "balance": self.balance,
             "trade_history": self.trade_history,
             "current_price": current_price,
+            "trade_cost": trade_cost,
+            "pct_return": pct_return,
+            "reward": reward,
+            "price_change_pct": price_change_pct,
+            "action": action,
         }
 
         return obs, reward, terminated, truncated, info

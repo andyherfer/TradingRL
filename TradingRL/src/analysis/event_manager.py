@@ -56,6 +56,7 @@ class EventManager:
         self.logger = logging.getLogger(__name__)
         self.is_running = False
         self.event_queue = asyncio.Queue()
+        self._processing_task = None
 
     def subscribe(
         self,
@@ -78,24 +79,47 @@ class EventManager:
 
     async def start(self) -> None:
         """Start event processing."""
+        if self.is_running:
+            return
+
         self.is_running = True
-        try:
-            while self.is_running:
-                event = await self.event_queue.get()
-                await self._process_event(event)
-                self.event_queue.task_done()
-        except Exception as e:
-            self.logger.error(f"Error in event processing loop: {e}")
-            raise
+        self._processing_task = asyncio.create_task(self._process_events())
+
+        # Signal successful startup without waiting for events
+        await asyncio.sleep(0)
 
     async def stop(self) -> None:
         """Stop event processing."""
+        if not self.is_running:
+            return
+
         self.is_running = False
-        # Process remaining events
-        while not self.event_queue.empty():
-            event = await self.event_queue.get()
-            await self._process_event(event)
-            self.event_queue.task_done()
+        if self._processing_task:
+            self._processing_task.cancel()
+            try:
+                await self._processing_task
+            except asyncio.CancelledError:
+                pass
+            self._processing_task = None
+
+    async def _process_events(self) -> None:
+        """Process events from queue."""
+        try:
+            while self.is_running:
+                try:
+                    async with asyncio.timeout(1.0):  # 1 second timeout
+                        event = await self.event_queue.get()
+                        await self._process_event(event)
+                        self.event_queue.task_done()
+                except TimeoutError:
+                    continue  # No events to process, continue loop
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    self.logger.error(f"Error processing event: {e}")
+        except Exception as e:
+            self.logger.error(f"Error in event processing loop: {e}")
+            self.is_running = False
 
     async def _process_event(self, event: Event) -> None:
         """Process a single event."""

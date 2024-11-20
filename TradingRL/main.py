@@ -27,6 +27,7 @@ from TradingRL.src.strategy.rl_strategy import RLStrategy
 from TradingRL.src.analysis.market_analyzer import MarketAnalyzer
 from TradingRL.src.analysis.performance_analyzer import PerformanceAnalyzer
 from TradingRL.src.monitoring.system_monitor import SystemMonitor, MonitorConfig
+from TradingRL.src.data.data_fetcher_adapter import DataFetcherAdapter
 
 
 class ComponentStatus(Enum):
@@ -215,16 +216,28 @@ class TradingSystem:
             # Initialize core components
             self.components["event_manager"] = EventManager()
             self.components["database"] = Database(config=self.config["database"])
+            await self.components["database"].initialize()
 
-            # Initialize data components
-            self.components["data_fetcher"] = DataFetcher(
-                api_key=self.config["exchange"]["api_key"],
-                api_secret=self.config["exchange"]["api_secret"],
-                symbols=self.config["trading"]["symbols"],
-                timeframes=self.config["trading"]["timeframes"],
+            # Initialize monitor first
+            self.components["monitor"] = SystemMonitor(
+                config=MonitorConfig(
+                    update_interval=self.config["monitor"]["update_interval"],
+                    history_size=self.config["monitor"]["history_size"],
+                    save_interval=self.config["monitor"]["save_interval"],
+                )
             )
 
-            # Initialize analysis components
+            # Initialize data components
+            self.components["data_fetcher"] = DataFetcherAdapter(
+                DataFetcher(
+                    api_key=self.config["exchange"]["api_key"],
+                    api_secret=self.config["exchange"]["api_secret"],
+                    symbols=self.config["trading"]["symbols"],
+                )
+            )
+            await self.components["data_fetcher"].initialize()
+
+            # Initialize analysis components (these don't need async initialization)
             self.components["market_analyzer"] = MarketAnalyzer(
                 event_manager=self.components["event_manager"]
             )
@@ -272,12 +285,16 @@ class TradingSystem:
                 market_analyzer=self.components["market_analyzer"],
             )
 
-            # Initialize monitor
-            self.components["monitor"] = SystemMonitor(
-                config=MonitorConfig(
-                    update_interval=self.config["monitor"]["update_interval"]
-                )
-            )
+            # Register components with monitor
+            monitor_components = {
+                "data_fetcher": self.components["data_fetcher"],
+                "trader": self.components["trader"],
+                "order_manager": self.components["order_manager"],
+                "portfolio_manager": self.components["portfolio_manager"],
+                "strategy": self.components["strategy"],
+                "market_analyzer": self.components["market_analyzer"],
+            }
+            self.components["monitor"].register_components(monitor_components)
 
             self.logger.info("System initialization completed")
 

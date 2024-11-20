@@ -3,7 +3,6 @@ from dataclasses import dataclass
 from datetime import datetime
 import numpy as np
 import pandas as pd
-from enum import Enum
 import logging
 import asyncio
 from abc import ABC, abstractmethod
@@ -16,26 +15,7 @@ from ..analysis.event_manager import EventManager, Event, EventType, EventPriori
 from ..core.risk_manager import RiskManager
 from ..core.portfolio_manager import PortfolioManager
 from ..analysis.market_analyzer import MarketAnalyzer, MarketRegime
-
-
-class SignalType(Enum):
-    """Trading signal types."""
-
-    LONG = "long"
-    SHORT = "short"
-    EXIT_LONG = "exit_long"
-    EXIT_SHORT = "exit_short"
-    NO_SIGNAL = "no_signal"
-
-
-class StrategyState(Enum):
-    """Strategy states."""
-
-    INACTIVE = "inactive"
-    ACTIVE = "active"
-    WARMUP = "warmup"
-    OPTIMIZING = "optimizing"
-    ERROR = "error"
+from .strategy_types import SignalType, StrategyState
 
 
 @dataclass
@@ -61,6 +41,8 @@ class StrategyConfig:
     optimization_interval: int = 1440  # minutes
     max_positions: int = 5
     position_sizing_method: str = "kelly"
+    min_position_size: float = 0.01
+    max_position_size: float = 1.0
 
 
 class BaseStrategy(ABC):
@@ -430,3 +412,29 @@ class BaseStrategy(ABC):
         except Exception as e:
             self.logger.error(f"Error updating performance metrics: {e}")
             raise
+
+    async def _fetch_historical_data(self, symbol: str, period: str) -> pd.DataFrame:
+        """Fetch historical data for warmup."""
+        try:
+            # For testing, use the provided market data
+            if hasattr(self, "test_market_data"):
+                return self.test_market_data.get(symbol, pd.DataFrame())
+
+            # Convert period to number of candles
+            period_map = {
+                "1d": 1440,  # 1 day in minutes
+                "1w": 10080,  # 1 week in minutes
+                "1M": 43200,  # 1 month (30 days) in minutes
+            }
+            num_candles = period_map.get(period, 1440)  # Default to 1 day
+
+            # Use data fetcher to get historical data
+            data = await self.data_fetcher.get_historical_data(
+                symbol=symbol, interval="1m", limit=num_candles
+            )
+
+            return data
+
+        except Exception as e:
+            self.logger.error(f"Error fetching historical data: {e}")
+            return pd.DataFrame()

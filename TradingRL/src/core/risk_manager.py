@@ -2,8 +2,14 @@ from typing import Dict, Any, Optional
 import logging
 from dataclasses import dataclass
 import numpy as np
+from datetime import datetime
 
-from TradingRL.src.analysis.event_manager import EventManager, Event, EventType
+from TradingRL.src.analysis.event_manager import (
+    EventManager,
+    Event,
+    EventType,
+    EventPriority,
+)
 
 
 @dataclass
@@ -22,86 +28,142 @@ class RiskManager:
     """Manages trading risk and position sizing."""
 
     def __init__(self, config: Dict[str, Any]):
-        """Initialize risk manager.
-
-        Args:
-            config: Risk configuration dictionary
-        """
+        """Initialize risk manager."""
+        self.config = config
         self.logger = logging.getLogger(__name__)
-        self.config = RiskConfig(**config)
+        self.metrics = {
+            "current_drawdown": 0.0,
+            "max_drawdown": 0.0,
+            "risk_exposure": 0.0,
+            "position_sizes": {},
+            "emergency_status": False,
+        }
 
-        # Initialize risk metrics
-        self.current_drawdown = 0.0
-        self.peak_portfolio_value = 0.0
-        self.position_sizes = {}
-        self.risk_levels = {}
-
-    async def check_risk_limits(self, trade_info: Dict[str, Any]) -> Dict[str, Any]:
-        """Check if a trade meets risk management criteria."""
+    async def update_risk_status(self, emergency: bool = False) -> None:
+        """Update risk status and handle emergency situations."""
         try:
-            symbol = trade_info["symbol"]
-            size = trade_info["size"]
-            side = trade_info["side"]
+            self.metrics["emergency_status"] = emergency
 
-            # Check position size limits
-            if size > self.config.max_position_size:
-                return {
-                    "approved": False,
-                    "reason": f"Position size {size} exceeds maximum {self.config.max_position_size}",
-                }
-
-            # Check drawdown limits
-            if self.current_drawdown > self.config.max_drawdown:
-                return {
-                    "approved": False,
-                    "reason": f"Current drawdown {self.current_drawdown:.2%} exceeds maximum {self.config.max_drawdown:.2%}",
-                }
-
-            # Check leverage limits
-            leverage = trade_info.get("leverage", 1.0)
-            if leverage > self.config.max_leverage:
-                return {
-                    "approved": False,
-                    "reason": f"Leverage {leverage} exceeds maximum {self.config.max_leverage}",
-                }
-
-            return {"approved": True, "adjusted_size": size}
+            if emergency:
+                self.logger.warning("Emergency risk status activated")
+                # Emit risk alert event if we have event manager
+                if hasattr(self, "event_manager"):
+                    await self.event_manager.publish(
+                        Event(
+                            type=EventType.RISK_UPDATE,
+                            data={
+                                "status": "emergency",
+                                "metrics": self.metrics,
+                                "timestamp": datetime.now(),
+                            },
+                            priority=EventPriority.HIGH,
+                        )
+                    )
+            else:
+                self.logger.info("Risk status normalized")
 
         except Exception as e:
-            self.logger.error(f"Error checking risk limits: {e}")
-            return {"approved": False, "reason": f"Risk check error: {str(e)}"}
+            self.logger.error(f"Error updating risk status: {e}")
 
-    def update_portfolio_value(self, portfolio_value: float) -> None:
-        """Update portfolio metrics for risk tracking."""
+    async def update_portfolio_value(self, total_value: float) -> None:
+        """Update portfolio value and risk metrics."""
         try:
-            if portfolio_value > self.peak_portfolio_value:
-                self.peak_portfolio_value = portfolio_value
+            # Calculate drawdown
+            if not hasattr(self, "peak_value"):
+                self.peak_value = total_value
+            elif total_value > self.peak_value:
+                self.peak_value = total_value
 
-            if self.peak_portfolio_value > 0:
-                self.current_drawdown = (
-                    self.peak_portfolio_value - portfolio_value
-                ) / self.peak_portfolio_value
+            current_drawdown = (self.peak_value - total_value) / self.peak_value
+            self.metrics["current_drawdown"] = current_drawdown
+
+            # Update max drawdown
+            if current_drawdown > self.metrics["max_drawdown"]:
+                self.metrics["max_drawdown"] = current_drawdown
+
+            # Check for emergency conditions
+            if current_drawdown > self.config["max_drawdown"]:
+                await self.update_risk_status(emergency=True)
 
         except Exception as e:
             self.logger.error(f"Error updating portfolio value: {e}")
 
-    def calculate_position_size(
-        self, symbol: str, price: float, available_balance: float
-    ) -> float:
-        """Calculate appropriate position size based on risk parameters."""
+    async def calculate_position_risk(self, position: Dict[str, Any]) -> float:
+        """Calculate risk score for a position."""
         try:
-            if self.config.position_sizing_method == "fixed":
-                return min(
-                    available_balance * self.config.max_position_size,
-                    available_balance * (1 - self.current_drawdown),
-                )
-            else:
-                # Implement other position sizing methods here
-                return available_balance * self.config.max_position_size
+            # Basic risk calculation based on position size and unrealized PnL
+            position_size = position.get("quantity", 0) * position.get(
+                "current_price", 0
+            )
+            unrealized_pnl = position.get("unrealized_pnl", 0)
+
+            # Calculate risk factors
+            size_risk = position_size / self.config.get("max_position_size", 1.0)
+            pnl_risk = abs(unrealized_pnl) / position_size if position_size > 0 else 0
+
+            # Combine risk factors (weighted average)
+            risk_score = (size_risk * 0.6) + (pnl_risk * 0.4)
+
+            return min(risk_score, 1.0)  # Normalize to 0-1
+
+        except Exception as e:
+            self.logger.error(f"Error calculating position risk: {e}")
+            return 1.0  # Return max risk on error
+
+    async def calculate_position_size(
+        self, amount: float, risk_factor: float = 0.5
+    ) -> float:
+        """
+        Calculate position size based on risk parameters.
+
+        Args:
+            amount: Base amount for position
+            risk_factor: Risk factor between 0 and 1
+        """
+        try:
+            # Get max position size from config
+            max_size = self.config.get("max_position_size", 1.0)
+
+            # Calculate position size based on risk factor
+            position_size = amount * risk_factor * max_size
+
+            # Ensure within limits
+            position_size = min(position_size, max_size)
+            position_size = max(position_size, 0.0)
+
+            return position_size
 
         except Exception as e:
             self.logger.error(f"Error calculating position size: {e}")
             return 0.0
+
+    async def check_risk_limits(
+        self, position_size: float, current_drawdown: float
+    ) -> bool:
+        """
+        Check if position size and drawdown are within risk limits.
+
+        Args:
+            position_size: Position size to check
+            current_drawdown: Current drawdown percentage
+        """
+        try:
+            # Get risk limits from config
+            max_position = self.config.get("max_position_size", 1.0)
+            max_drawdown = self.config.get("max_drawdown", 0.2)
+
+            # Check limits
+            if position_size > max_position:
+                return False
+
+            if current_drawdown > max_drawdown:
+                return False
+
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Error checking risk limits: {e}")
+            return False
 
     def get_stop_loss_price(self, entry_price: float, side: str) -> float:
         """Calculate stop loss price based on configuration."""

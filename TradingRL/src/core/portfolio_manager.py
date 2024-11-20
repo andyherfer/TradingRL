@@ -7,7 +7,12 @@ from collections import defaultdict
 import numpy as np
 import pandas as pd
 
-from TradingRL.src.analysis.event_manager import EventManager, Event, EventType
+from TradingRL.src.analysis.event_manager import (
+    EventManager,
+    Event,
+    EventType,
+    EventPriority,
+)
 from TradingRL.src.core.risk_manager import RiskManager
 from TradingRL.src.core.order_manager import OrderManager
 
@@ -58,6 +63,9 @@ class PortfolioManager:
 
         # Subscribe to events
         self._setup_event_subscriptions()
+
+        self._running = False
+        self._update_task = None
 
     def _setup_event_subscriptions(self) -> None:
         """Setup event subscriptions."""
@@ -208,3 +216,197 @@ class PortfolioManager:
                 )
         except Exception as e:
             self.logger.error(f"Error closing all positions: {e}")
+
+    async def handle_risk_event(self, event: Dict[str, Any]) -> None:
+        """Handle risk-related events."""
+        try:
+            # Extract risk data
+            drawdown = event["data"].get("drawdown", 0.0)
+            positions = event["data"].get("positions", [])
+
+            # Check if emergency action is needed
+            if drawdown > self.risk_manager.config["max_drawdown"]:
+                self.logger.warning(f"Emergency risk handling: Drawdown {drawdown:.2%}")
+                await self._handle_emergency_risk(positions)
+
+            # Update position risk metrics
+            for position in positions:
+                await self._update_position_risk(position)
+
+        except Exception as e:
+            self.logger.error(f"Error handling risk event: {e}")
+
+    async def _handle_emergency_risk(self, positions: List[Dict[str, Any]]) -> None:
+        """Handle emergency risk situations."""
+        try:
+            # Close all positions if drawdown exceeds limit
+            for position in positions:
+                await self.close_position(
+                    symbol=position["symbol"],
+                    reason="emergency_risk",
+                    metadata={"drawdown": True},
+                )
+
+            # Update risk manager status
+            await self.risk_manager.update_risk_status(emergency=True)
+
+            # Emit emergency event
+            event = Event(
+                type=EventType.RISK_UPDATE,
+                data={
+                    "action": "emergency_closure",
+                    "positions": positions,
+                    "timestamp": datetime.now(),
+                },
+                priority=EventPriority.HIGH,
+            )
+            await self.event_manager.publish(event)
+
+            self.logger.warning(
+                f"Emergency risk handling completed. Closed {len(positions)} positions"
+            )
+
+        except Exception as e:
+            self.logger.error(f"Error in emergency risk handling: {e}")
+
+    async def _update_position_risk(self, position: Dict[str, Any]) -> None:
+        """Update risk metrics for a position."""
+        try:
+            symbol = position["symbol"]
+            if symbol in self.positions:
+                # Update position risk metrics
+                self.positions[symbol].update(
+                    {
+                        "risk_score": await self.risk_manager.calculate_position_risk(
+                            position
+                        ),
+                        "last_risk_update": datetime.now(),
+                    }
+                )
+        except Exception as e:
+            self.logger.error(f"Error updating position risk: {e}")
+
+    async def start(self) -> None:
+        """Start portfolio manager."""
+        if self._running:
+            return
+        self._running = True
+        self._update_task = asyncio.create_task(self._update_loop())
+        self.logger.info("Portfolio manager started")
+
+    async def stop(self) -> None:
+        """Stop portfolio manager."""
+        if not self._running:
+            return
+        self._running = False
+        if self._update_task:
+            self._update_task.cancel()
+            try:
+                await self._update_task
+            except asyncio.CancelledError:
+                pass
+        self.logger.info("Portfolio manager stopped")
+
+    async def _update_loop(self) -> None:
+        """Background loop for portfolio updates."""
+        while self._running:
+            try:
+                # Update portfolio metrics
+                total_value = self.get_total_value()
+                drawdown = (self.initial_capital - total_value) / self.initial_capital
+
+                # Check risk limits
+                if drawdown > self.risk_manager.config["max_drawdown"]:
+                    await self.handle_risk_event(
+                        {
+                            "type": EventType.RISK_UPDATE,
+                            "data": {
+                                "drawdown": drawdown,
+                                "positions": list(self.positions.values()),
+                            },
+                        }
+                    )
+
+                # Emit portfolio update event
+                await self.event_manager.publish(
+                    Event(
+                        type=EventType.POSITION_UPDATE,
+                        data={
+                            "total_value": total_value,
+                            "balance": self.balance,
+                            "positions": {
+                                symbol: vars(pos)
+                                for symbol, pos in self.positions.items()
+                            },
+                            "metrics": self.metrics,
+                            "timestamp": datetime.now(),
+                        },
+                    )
+                )
+
+                await asyncio.sleep(60)  # Update every minute
+
+            except Exception as e:
+                self.logger.error(f"Error in portfolio update loop: {e}")
+                await asyncio.sleep(5)  # Short delay on error
+
+    async def close_position(
+        self, symbol: str, reason: str = "", metadata: Dict = None
+    ) -> None:
+        """Close a position."""
+        try:
+            if symbol not in self.positions:
+                self.logger.warning(f"No position found for {symbol}")
+                return
+
+            position = self.positions[symbol]
+
+            # Create close order
+            order = {
+                "symbol": symbol,
+                "side": "sell" if position["side"] == "long" else "buy",
+                "type": "MARKET",
+                "quantity": position["quantity"],
+                "reduce_only": True,
+                "metadata": {
+                    "reason": reason,
+                    **(metadata or {}),
+                },
+            }
+
+            # Submit close order
+            await self.order_manager.submit_order(order)
+
+            # Record position closure
+            self.position_history.append(
+                {
+                    **position,
+                    "exit_price": position["current_price"],
+                    "exit_time": datetime.now(),
+                    "reason": reason,
+                    "metadata": metadata,
+                }
+            )
+
+            # Remove position
+            del self.positions[symbol]
+
+            # Emit position closed event
+            await self.event_manager.publish(
+                Event(
+                    type=EventType.POSITION_CLOSED,
+                    data={
+                        "symbol": symbol,
+                        "position": position,
+                        "reason": reason,
+                        "metadata": metadata,
+                        "timestamp": datetime.now(),
+                    },
+                )
+            )
+
+            self.logger.info(f"Closed position for {symbol}: {position}")
+
+        except Exception as e:
+            self.logger.error(f"Error closing position for {symbol}: {e}")
+            raise

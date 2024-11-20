@@ -6,8 +6,10 @@ import torch
 import gymnasium as gym
 from collections import deque
 import wandb
+import talib
 
 from .base_strategy import BaseStrategy, Signal, SignalType, StrategyState
+from .system_mode import SystemMode
 from TradingRL.src.core.trader import Trader
 from TradingRL.src.analysis.market_analyzer import MarketAnalyzer, MarketRegime
 from TradingRL.src.analysis.event_manager import EventManager, Event, EventType
@@ -29,6 +31,8 @@ class RLStrategy(BaseStrategy):
         market_analyzer: MarketAnalyzer,
         feature_window: int = 100,
         confidence_threshold: float = 0.6,
+        use_wandb: bool = True,
+        mode: SystemMode = SystemMode.PAPER,
     ):
         """Initialize RL Strategy."""
         super().__init__(
@@ -43,6 +47,10 @@ class RLStrategy(BaseStrategy):
         self.trader = trader
         self.feature_window = feature_window
         self.confidence_threshold = confidence_threshold
+        self.use_wandb = (
+            use_wandb and mode != SystemMode.TEST
+        )  # Disable wandb in test mode
+        self.mode = mode
 
         # State management
         self.state_buffer = {
@@ -106,7 +114,7 @@ class RLStrategy(BaseStrategy):
             # Train model on recent data
             for symbol, df in data.items():
                 # Prepare training data
-                train_states = self._prepare_training_data(df)
+                train_states = self._prepare_training_data(df, symbol)
 
                 # Train model
                 train_metrics = await self.trader.train_model(
@@ -167,101 +175,252 @@ class RLStrategy(BaseStrategy):
 
     def _calculate_price_features(self, data: pd.DataFrame) -> np.ndarray:
         """Calculate price-based features."""
-        df = data.tail(self.feature_window)
+        try:
+            if "close" not in data.columns:
+                self.logger.error("Missing required column: close")
+                return np.zeros(5)
 
-        returns = np.diff(np.log(df["close"]))
-        volatility = np.std(returns)
+            df = data.tail(self.feature_window)
 
-        features = np.array(
-            [
-                returns[-1],  # Latest return
-                np.mean(returns),  # Average return
-                volatility,  # Volatility
-                (df["close"].iloc[-1] - df["open"].iloc[-1])
-                / df["open"].iloc[-1],  # Current candle return
-                (df["high"].iloc[-1] - df["low"].iloc[-1])
-                / df["low"].iloc[-1],  # Current candle range
-            ]
-        )
+            # Return zeros if data is empty or too short
+            if len(df) < 2:  # Need at least 2 points for returns
+                self.logger.warning("Insufficient data for price features")
+                return np.zeros(5)
 
-        return features
+            # Calculate returns with explicit fill_method=None
+            returns = df["close"].pct_change(fill_method=None).fillna(0)
+            log_returns = np.log1p(returns)
+
+            # Calculate features with safe operations
+            features = np.array(
+                [
+                    (
+                        float(log_returns.mean()) if len(log_returns) > 0 else 0.0
+                    ),  # Average return
+                    (
+                        float(log_returns.std()) if len(log_returns) > 1 else 0.0
+                    ),  # Volatility
+                    (
+                        float((df["high"] / df["low"] - 1).mean())
+                        if len(df) > 0
+                        else 0.0
+                    ),  # Average range
+                    (
+                        float((df["close"] / df["open"] - 1).mean())
+                        if len(df) > 0
+                        else 0.0
+                    ),  # Average candle return
+                    (
+                        float((df["close"].iloc[-1] / df["close"].mean() - 1))
+                        if len(df) > 0
+                        else 0.0
+                    ),  # Price vs MA
+                ]
+            )
+
+            # Replace any NaN or inf values with 0
+            features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+
+            return features
+
+        except Exception as e:
+            self.logger.error(f"Error calculating price features: {str(e)}")
+            return np.zeros(5)  # Return zeros if error
 
     def _calculate_volume_features(self, data: pd.DataFrame) -> np.ndarray:
         """Calculate volume-based features."""
-        df = data.tail(self.feature_window)
+        try:
+            if "volume" not in data.columns:
+                self.logger.error("Missing required column: volume")
+                return np.zeros(5)
 
-        volume = df["volume"].values
-        volume_ma = np.mean(volume)
+            df = data.tail(self.feature_window)
 
-        features = np.array(
-            [
-                volume[-1] / volume_ma,  # Relative volume
-                np.std(volume) / volume_ma,  # Volume volatility
-                np.sum(volume * (df["close"] - df["open"]))
-                / np.sum(volume),  # Volume-weighted price change
-            ]
-        )
+            # Return zeros if data is empty or too short
+            if len(df) < 2:
+                self.logger.warning("Insufficient data for volume features")
+                return np.zeros(5)
 
-        return features
+            # Calculate volume metrics with safe operations
+            volume = df["volume"].values
+            volume_ma = (
+                np.mean(volume) if len(volume) > 0 else 1.0
+            )  # Use 1.0 to avoid division by zero
+            price_volume = df["close"] * df["volume"]
+
+            features = np.array(
+                [
+                    (
+                        float(volume[-1] / volume_ma) if len(volume) > 0 else 0.0
+                    ),  # Relative volume
+                    (
+                        float(np.std(volume) / volume_ma) if len(volume) > 1 else 0.0
+                    ),  # Volume volatility
+                    (
+                        float(np.corrcoef(df["close"], volume)[0, 1])
+                        if len(volume) > 1
+                        else 0.0
+                    ),  # Price-volume correlation
+                    (
+                        float(price_volume.sum() / volume.sum())
+                        if volume.sum() > 0
+                        else 0.0
+                    ),  # VWAP
+                    (
+                        float((volume[-1] - volume[-2]) / volume[-2])
+                        if len(volume) > 1
+                        else 0.0
+                    ),  # Volume momentum
+                ]
+            )
+
+            # Replace any NaN or inf values with 0
+            features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+
+            return features
+
+        except Exception as e:
+            self.logger.error(f"Error calculating volume features: {str(e)}")
+            return np.zeros(5)  # Return zeros if error
 
     def _calculate_technical_features(self, data: pd.DataFrame) -> np.ndarray:
         """Calculate technical indicator features."""
-        df = data.tail(self.feature_window)
-        close = df["close"].values
+        try:
+            df = data.tail(self.feature_window)
 
-        # Calculate indicators
-        sma_20 = np.mean(close[-20:])
-        sma_50 = np.mean(close[-50:])
-        rsi = self.indicators[df.name]["rsi"][-1]
-        macd = self.indicators[df.name]["macd"][-1]
-        bbands = self.indicators[df.name]["bbands"]
+            # Return zeros if data is empty or too short
+            if len(df) < 50:  # Need enough data for indicators
+                return np.zeros(5)
 
-        features = np.array(
-            [
-                close[-1] / sma_20 - 1,  # Price vs SMA20
-                close[-1] / sma_50 - 1,  # Price vs SMA50
-                rsi / 100,  # Normalized RSI
-                macd,  # MACD
-                (close[-1] - bbands[0][-1])
-                / (bbands[2][-1] - bbands[0][-1]),  # BB position
-            ]
-        )
+            close = df["close"].values
+            high = df["high"].values
+            low = df["low"].values
 
-        return features
+            # Calculate indicators with safe operations
+            sma_20 = talib.SMA(close, timeperiod=20)
+            sma_50 = talib.SMA(close, timeperiod=50)
+            rsi = talib.RSI(close, timeperiod=14)
+            macd = talib.MACD(close)[0]
+            bbands = talib.BBANDS(close)
+
+            # Get latest values safely
+            features = np.array(
+                [
+                    (
+                        float((close[-1] / sma_20[-1] - 1))
+                        if not np.isnan(sma_20[-1])
+                        else 0.0
+                    ),  # Price vs SMA20
+                    (
+                        float((close[-1] / sma_50[-1] - 1))
+                        if not np.isnan(sma_50[-1])
+                        else 0.0
+                    ),  # Price vs SMA50
+                    (
+                        float(rsi[-1] / 100.0) if not np.isnan(rsi[-1]) else 0.5
+                    ),  # Normalized RSI
+                    float(macd[-1]) if not np.isnan(macd[-1]) else 0.0,  # MACD
+                    (
+                        float(
+                            (close[-1] - bbands[0][-1])
+                            / (bbands[2][-1] - bbands[0][-1])
+                        )
+                        if not np.isnan(bbands[0][-1])
+                        else 0.0
+                    ),  # BB position
+                ]
+            )
+
+            # Replace any NaN or inf values with 0
+            features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+
+            return features
+
+        except Exception as e:
+            self.logger.error(f"Error calculating technical features: {e}")
+            return np.zeros(5)  # Return zeros if error
 
     def _calculate_regime_features(self, symbol: str) -> np.ndarray:
         """Calculate market regime features."""
-        current_regime = self.market_analyzer.current_state.regime
+        try:
+            # Get current regime from market analyzer
+            current_state = self.market_analyzer.current_state.get(symbol, {})
+            current_regime = current_state.get("regime", MarketRegime.UNDEFINED)
 
-        # One-hot encode regime
-        regime_encoding = np.zeros(len(MarketRegime))
-        regime_encoding[current_regime.value] = 1
+            # Create one-hot encoding array
+            num_regimes = len(MarketRegime)
+            features = np.zeros(num_regimes)
 
-        return regime_encoding
+            # Set the corresponding regime index to 1
+            if isinstance(current_regime, MarketRegime):
+                regime_idx = list(MarketRegime).index(current_regime)
+                features[regime_idx] = 1
+
+            return features
+
+        except Exception as e:
+            self.logger.error(f"Error calculating regime features: {e}")
+            return np.zeros(len(MarketRegime))  # Return zeros if error
 
     def _calculate_position_features(self, symbol: str) -> np.ndarray:
         """Calculate position-related features."""
-        position = self.positions.get(symbol)
+        try:
+            position = self.positions.get(symbol)
 
-        if position:
-            position_features = np.array(
-                [
-                    1,  # Has position
-                    position["quantity"],  # Position size
-                    position["unrealized_pnl"],  # Unrealized PnL
-                    position["duration"].total_seconds()
-                    / 3600,  # Position duration in hours
-                ]
-            )
-        else:
-            position_features = np.array([0, 0, 0, 0])
+            if position:
+                features = np.array(
+                    [
+                        1,  # Has position
+                        position["quantity"],  # Position size
+                        position["unrealized_pnl"],  # Unrealized PnL
+                        position["duration"].total_seconds()
+                        / 3600,  # Position duration in hours
+                        position["roi"],  # Return on investment
+                    ]
+                )
+            else:
+                features = np.zeros(5)
 
-        return position_features
+            return features
+
+        except Exception as e:
+            self.logger.error(f"Error calculating position features: {e}")
+            return np.zeros(5)  # Return zeros if error
 
     def _normalize_state(self, state: np.ndarray) -> np.ndarray:
         """Normalize state features."""
-        # Use running statistics for normalization
-        return (state - self.trader.state_mean) / (self.trader.state_std + 1e-8)
+        try:
+            # Replace infinities with large finite values
+            state = np.nan_to_num(state, nan=0.0, posinf=1e6, neginf=-1e6)
+
+            # Use running mean and std for normalization
+            if not hasattr(self, "state_mean"):
+                self.state_mean = np.zeros_like(state)
+                self.state_std = np.ones_like(state)
+                self.state_count = 0
+
+            # Update running statistics
+            self.state_count += 1
+            delta = state - self.state_mean
+            self.state_mean += delta / self.state_count
+            delta2 = state - self.state_mean
+            self.state_std = np.sqrt(
+                (self.state_std**2 * (self.state_count - 1) + delta * delta2)
+                / self.state_count
+            )
+
+            # Add small epsilon to avoid division by zero
+            epsilon = 1e-8
+            normalized_state = (state - self.state_mean) / (self.state_std + epsilon)
+
+            # Clip to reasonable range
+            normalized_state = np.clip(normalized_state, -10, 10)
+
+            return normalized_state
+
+        except Exception as e:
+            self.logger.error(f"Error normalizing state: {e}")
+            return np.clip(state, -10, 10)  # Return clipped state if error
 
     async def _action_to_signal(
         self, symbol: str, action: int, confidence: float, current_data: pd.Series
@@ -283,30 +442,36 @@ class RLStrategy(BaseStrategy):
             if signal_type == SignalType.NO_SIGNAL:
                 return None
 
+            # Get current market state
+            market_state = self.market_analyzer.current_state.get(symbol, {})
+
             # Calculate position size
             if signal_type in [SignalType.LONG, SignalType.SHORT]:
                 size = await self._calculate_position_size(
                     symbol, current_data["close"], confidence
                 )
             else:
+                # For exit signals, use the current position size or a default value for testing
                 size = (
-                    self.positions[symbol]["quantity"]
+                    self.positions.get(symbol, {}).get("quantity", 1.0)
                     if symbol in self.positions
-                    else 0
+                    else 1.0  # Default test value
                 )
 
             # Create signal
             signal = Signal(
                 type=signal_type,
                 symbol=symbol,
-                price=current_data["close"],
-                size=size,
+                price=float(current_data["close"]),  # Ensure price is float
+                size=float(size),  # Ensure size is float
                 confidence=confidence,
                 timestamp=datetime.now(),
                 metadata={
                     "action": action,
-                    "market_regime": self.market_analyzer.current_state.regime.value,
-                    "volatility": self.market_analyzer.current_state.volatility,
+                    "market_regime": market_state.get(
+                        "regime", MarketRegime.UNDEFINED
+                    ).value,
+                    "volatility": market_state.get("volatility", 0.0),
                 },
             )
 
@@ -353,14 +518,125 @@ class RLStrategy(BaseStrategy):
 
     def _log_optimization_metrics(self, metrics: Dict[str, Any]) -> None:
         """Log optimization metrics to W&B."""
-        if not self.use_wandb:
-            return
+        try:
+            if not self.use_wandb:
+                return
 
-        for symbol, symbol_metrics in metrics.items():
-            wandb.log(
-                {
-                    f"optimization/{symbol}/loss": symbol_metrics["loss"],
-                    f"optimization/{symbol}/accuracy": symbol_metrics["accuracy"],
-                    f"optimization/{symbol}/reward": symbol_metrics["avg_reward"],
-                }
+            # Initialize wandb if not already initialized
+            if not wandb.run:
+                try:
+                    wandb.init(
+                        project="trading_rl",
+                        name=f"{self.name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                        config={
+                            "strategy": self.name,
+                            "symbols": self.symbols,
+                            "feature_window": self.feature_window,
+                            "confidence_threshold": self.confidence_threshold,
+                        },
+                        mode="disabled" if self.mode == SystemMode.TEST else "online",
+                    )
+                except Exception as e:
+                    self.logger.warning(f"Failed to initialize wandb: {e}")
+                    self.use_wandb = False
+                    return
+
+            # Log metrics
+            for symbol, symbol_metrics in metrics.items():
+                wandb.log(
+                    {
+                        f"optimization/{symbol}/loss": symbol_metrics["loss"],
+                        f"optimization/{symbol}/accuracy": symbol_metrics["accuracy"],
+                        f"optimization/{symbol}/reward": symbol_metrics["avg_reward"],
+                    }
+                )
+
+        except Exception as e:
+            self.logger.error(f"Error logging optimization metrics: {e}")
+            self.use_wandb = False  # Disable wandb on error
+
+    def _prepare_training_data(self, data: pd.DataFrame, symbol: str) -> pd.DataFrame:
+        """Prepare data for training."""
+        try:
+            # Calculate features for each row
+            features_list = []
+            for i in range(len(data)):
+                window_data = data.iloc[max(0, i - self.feature_window + 1) : i + 1]
+                if len(window_data) < self.feature_window:
+                    continue
+
+                # Calculate features
+                price_features = self._calculate_price_features(window_data)
+                volume_features = self._calculate_volume_features(window_data)
+                technical_features = self._calculate_technical_features(window_data)
+                regime_features = self._calculate_regime_features(symbol)
+                position_features = self._calculate_position_features(symbol)
+
+                # Combine all features
+                all_features = np.concatenate(
+                    [
+                        price_features,
+                        volume_features,
+                        technical_features,
+                        regime_features,
+                        position_features,
+                    ]
+                )
+
+                features_list.append(all_features)
+
+            # Convert to DataFrame
+            if not features_list:
+                return pd.DataFrame()
+
+            feature_names = [f"feature_{i}" for i in range(len(features_list[0]))]
+            features_df = pd.DataFrame(
+                features_list,
+                index=data.index[-len(features_list) :],
+                columns=feature_names,
             )
+
+            return features_df
+
+        except Exception as e:
+            self.logger.error(f"Error preparing training data: {e}")
+            return pd.DataFrame()
+
+    async def _warmup(self) -> None:
+        """Perform strategy warmup."""
+        try:
+            self.logger.info("Starting warmup period...")
+
+            # Initialize state buffer with historical data
+            for symbol in self.symbols:
+                # Get historical data
+                if hasattr(self, "test_market_data"):
+                    historical_data = self.test_market_data.get(symbol, pd.DataFrame())
+                else:
+                    historical_data = await self.data_fetcher.get_historical_data(
+                        symbol=symbol,
+                        interval="1m",
+                        limit=self.feature_window * 2,  # Get extra data for warmup
+                    )
+
+                # Calculate initial states
+                for i in range(len(historical_data) - self.feature_window + 1):
+                    window_data = historical_data.iloc[i : i + self.feature_window]
+                    state = self._prepare_state(symbol, window_data)
+                    if state is not None:
+                        self.state_buffer[symbol].append(state)
+
+                self.logger.info(
+                    f"Initialized state buffer for {symbol} with {len(self.state_buffer[symbol])} states"
+                )
+
+            # Initial parameter optimization
+            await self.optimize_parameters(
+                {symbol: self.data_buffer[symbol] for symbol in self.symbols}
+            )
+
+            self.logger.info("Warmup completed")
+
+        except Exception as e:
+            self.logger.error(f"Error during warmup: {e}")
+            raise

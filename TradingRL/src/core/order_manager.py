@@ -99,6 +99,7 @@ class OrderManager:
         risk_manager: RiskManager,
         config: Optional[OrderConfig] = None,
         use_wandb: bool = True,
+        testnet: bool = True,
     ):
         """
         Initialize OrderManager.
@@ -110,18 +111,17 @@ class OrderManager:
             risk_manager: RiskManager instance
             config: Order configuration parameters
             use_wandb: Whether to use W&B logging
+            testnet: Whether to use testnet
         """
         self.client = Client(api_key, api_secret)
         self.event_manager = event_manager
         self.risk_manager = risk_manager
         self.config = config or OrderConfig()
         self.use_wandb = use_wandb
-
-        # Initialize logging
+        self.testnet = testnet
         self.logger = logging.getLogger(__name__)
-        self.logger.setLevel(logging.INFO)
-
-        # Order tracking
+        self._running = False
+        self._cleanup_task = None
         self.active_orders = {}
         self.order_history = []
         self.filled_orders = []
@@ -373,6 +373,16 @@ class OrderManager:
     async def _process_fill(self, order: Order, fill_data: Dict) -> None:
         """Process an order fill."""
         try:
+            # Add order to active orders if not already there
+            if order.id not in self.active_orders:
+                self.active_orders[order.id] = order
+                # Initialize metrics if needed
+                if "orders_filled" not in self.metrics:
+                    self.metrics["orders_filled"] = 0
+                    self.metrics["total_volume"] = 0.0
+                    self.metrics["total_fees"] = 0.0
+                    self.metrics["average_slippage"] = []
+
             # Update order fills
             order.fills.append(fill_data)
 
@@ -387,29 +397,20 @@ class OrderManager:
                 self.metrics["orders_filled"] += 1
                 self.filled_orders.append(order)
                 self.active_orders.pop(order.id)
-            else:
-                order.status = OrderStatus.PARTIALLY_FILLED
 
-            # Calculate and record slippage
-            if order.order_type == OrderType.MARKET:
-                expected_price = order.params.get("expected_price")
-                if expected_price:
-                    slippage = abs(fill_price - expected_price) / expected_price
-                    self.metrics["average_slippage"].append(slippage)
-
-            # Update metrics
-            self.metrics["total_volume"] += fill_quantity * fill_price
-            self.metrics["total_fees"] += fill_data.get("commission", 0)
-
-            # Log fill
-            if self.use_wandb:
-                wandb.log(
-                    {
-                        "fill/quantity": fill_quantity,
-                        "fill/price": fill_price,
-                        "fill/slippage": slippage if "slippage" in locals() else 0,
-                        "fill/fees": fill_data.get("commission", 0),
-                    }
+                # Emit order filled event
+                await self.event_manager.publish(
+                    Event(
+                        type=EventType.ORDER_FILLED,
+                        data={
+                            "order_id": order.id,
+                            "symbol": order.symbol,
+                            "quantity": filled_quantity,
+                            "price": fill_price,
+                            "side": order.side,
+                            "timestamp": datetime.now(),
+                        },
+                    )
                 )
 
         except Exception as e:
@@ -482,3 +483,52 @@ class OrderManager:
             raise ValueError(f"Order size too large: {quantity}")
         if price and price <= 0:
             raise ValueError(f"Invalid price: {price}")
+
+    async def start(self) -> None:
+        """Start order manager."""
+        if self._running:
+            return
+        self._running = True
+        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+        self.logger.info("Order manager started")
+
+    async def stop(self) -> None:
+        """Stop order manager."""
+        if not self._running:
+            return
+        self._running = False
+        if self._cleanup_task:
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
+        # Cancel any pending orders
+        await self._cancel_all_orders()
+        self.logger.info("Order manager stopped")
+
+    async def _cleanup_loop(self) -> None:
+        """Background loop for order cleanup and maintenance."""
+        while self._running:
+            try:
+                # Check for stale orders
+                current_time = datetime.now()
+                for order_id, order in list(self.active_orders.items()):
+                    if (
+                        current_time - order["timestamp"]
+                    ).total_seconds() > 300:  # 5 min timeout
+                        await self.cancel_order(order_id)
+
+                await asyncio.sleep(60)  # Check every minute
+
+            except Exception as e:
+                self.logger.error(f"Error in order cleanup loop: {e}")
+                await asyncio.sleep(5)
+
+    async def _cancel_all_orders(self) -> None:
+        """Cancel all active orders."""
+        try:
+            for order_id in list(self.active_orders.keys()):
+                await self.cancel_order(order_id)
+        except Exception as e:
+            self.logger.error(f"Error cancelling all orders: {e}")
