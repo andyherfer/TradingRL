@@ -220,7 +220,6 @@ class TradingEnvironment(gym.Env):
             if df[feature_cols].isna().any().any():
                 problematic_cols = (
                     df[feature_cols].columns[df[feature_cols].isna().any()].tolist()
-                )
                 raise ValueError(
                     f"NaN values still present in columns: {problematic_cols}"
                 )
@@ -920,6 +919,9 @@ class Trader:
                 name_prefix="trading_model",
             )
 
+            # Add WandB callback for training metrics
+            wandb_callback = WandBCallback(check_freq=100)  # Log every 100 steps
+
             # Initialize model
             self.model = PPO(
                 policy=hyperparams.get("policy", "MlpPolicy"),
@@ -941,10 +943,10 @@ class Trader:
                 verbose=1,
             )
 
-            # Train the model
+            # Train the model with all callbacks
             self.model.learn(
                 total_timesteps=total_timesteps,
-                callback=[eval_callback, checkpoint_callback],
+                callback=[eval_callback, checkpoint_callback, wandb_callback],
                 progress_bar=True,
             )
 
