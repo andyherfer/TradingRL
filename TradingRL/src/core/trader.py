@@ -921,7 +921,7 @@ class Trader:
             )
 
             # Add WandB callback for training metrics
-            wandb_callback = WandBCallback(check_freq=100)  # Log every 100 steps
+            wandb_callback = WandBCallback(check_freq=1000)  # Log every 1000 steps
 
             # Initialize model
             self.model = PPO(
