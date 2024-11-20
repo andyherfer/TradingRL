@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 import gymnasium as gym
 from gymnasium import spaces
 from stable_baselines3 import PPO
@@ -10,6 +10,7 @@ from stable_baselines3.common.callbacks import (
     BaseCallback,
 )
 from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.evaluation import evaluate_policy
 import torch
 import logging
 from datetime import datetime
@@ -21,6 +22,7 @@ import seaborn as sns
 from dataclasses import dataclass
 from collections import deque
 import platform
+from tqdm import tqdm
 
 
 @dataclass
@@ -48,37 +50,49 @@ class WandBCallback(BaseCallback):
 
     def _on_step(self) -> bool:
         """Called after each step in the environment."""
-        if self.n_calls % self.check_freq == 0:
-            # Log basic metrics
-            wandb.log(
-                {
-                    "train/timesteps": self.n_calls,
-                    "train/episode_reward": (
-                        np.mean(self.episode_rewards) if self.episode_rewards else 0
-                    ),
-                    "train/episode_length": (
-                        np.mean(self.episode_lengths) if self.episode_lengths else 0
-                    ),
-                },
-                step=self.n_calls,
-            )
+        try:
+            if self.n_calls % self.check_freq == 0 and wandb.run is not None:
+                # Log basic metrics
+                wandb.log(
+                    {
+                        "train/timesteps": self.n_calls,
+                        "train/episode_reward": (
+                            np.mean(self.episode_rewards) if self.episode_rewards else 0
+                        ),
+                        "train/episode_length": (
+                            np.mean(self.episode_lengths) if self.episode_lengths else 0
+                        ),
+                    },
+                    step=self.n_calls,
+                )
 
-            # Clear episode buffers
-            self.episode_rewards = []
-            self.episode_lengths = []
+                # Clear episode buffers
+                self.episode_rewards = []
+                self.episode_lengths = []
+
+        except Exception as e:
+            self.logger.warning(f"Error in WandB logging: {e}")
+            # Continue training even if logging fails
+            pass
 
         return True
 
     def _on_rollout_end(self) -> None:
         """Called after each rollout."""
-        # Get current environment info
-        env = self.training_env.envs[0]
-        self.portfolio_values.append(env.balance + env.position_value)
+        try:
+            if wandb.run is not None:
+                # Get current environment info
+                env = self.training_env.envs[0]
+                self.portfolio_values.append(env.balance + env.position_value)
 
-        # Log portfolio value
-        wandb.log(
-            {"train/portfolio_value": self.portfolio_values[-1]}, step=self.n_calls
-        )
+                # Log portfolio value
+                wandb.log(
+                    {"train/portfolio_value": self.portfolio_values[-1]},
+                    step=self.n_calls,
+                )
+        except Exception as e:
+            self.logger.warning(f"Error in WandB rollout logging: {e}")
+            pass
 
 
 class TradingEnvironment(gym.Env):
@@ -288,6 +302,7 @@ class TradingEnvironment(gym.Env):
         self.position = 0.0
         self.position_value = 0.0
         self.trade_history = []
+        self.portfolio_history = [self.initial_balance]
 
         initial_observation = self._get_observation()
         info = {
@@ -431,9 +446,12 @@ class TradingEnvironment(gym.Env):
             "action": action,
         }
 
+        # Add portfolio value to history
+        self.portfolio_history.append(self.balance + self.position_value)
+
         return obs, reward, terminated, truncated, info
 
-    def _plot_trading_actions(self, title: str = "Trading Actions") -> plt.Figure:
+    def plot_trading_actions(self, title: str = "Trading Actions") -> plt.Figure:
         """Create a plot of price with buy/sell markers."""
         fig, ax = plt.subplots(figsize=(15, 7))
 
@@ -504,7 +522,6 @@ class CustomTrainingCallback(BaseCallback):
         # Initialize training metrics tracking
         self.training_rewards = []
         self.episode_lengths = []
-        self.losses = {"policy_loss": [], "value_loss": [], "entropy_loss": []}
         self.current_episode_reward = 0
         self.current_episode_length = 0
 
@@ -521,206 +538,329 @@ class CustomTrainingCallback(BaseCallback):
             self.episode_lengths.append(self.current_episode_length)
 
             # Log episode metrics
-            wandb.log(
-                {
-                    "train/episode_reward": self.current_episode_reward,
-                    "train/episode_length": self.current_episode_length,
-                },
-                step=self.num_timesteps,
-            )
+            if wandb.run is not None:
+                wandb.log(
+                    {
+                        "train/episode_reward": self.current_episode_reward,
+                        "train/episode_length": self.current_episode_length,
+                    },
+                    step=self.num_timesteps,
+                )
 
             # Reset episode tracking
             self.current_episode_reward = 0
             self.current_episode_length = 0
 
-        # Log training losses if available
-        if "train" in self.locals:
-            train_info = self.locals["train"]
-            if train_info is not None:
-                wandb.log(
-                    {
-                        "train/policy_loss": train_info.get("policy_loss", 0),
-                        "train/value_loss": train_info.get("value_loss", 0),
-                        "train/entropy_loss": train_info.get("entropy_loss", 0),
-                        "train/learning_rate": self.locals["learning_rate"],
-                        "train/clip_range": self.locals["clip_range"],
-                        "train/clip_fraction": train_info.get("clip_fraction", 0),
-                        "train/approx_kl": train_info.get("approx_kl", 0),
-                        "train/explained_variance": train_info.get(
-                            "explained_variance", 0
-                        ),
-                    },
-                    step=self.num_timesteps,
-                )
-
         # Periodic evaluation
         if self.n_calls - self.last_eval_step >= self.eval_freq:
             self.last_eval_step = self.n_calls
+            self.logger.info(f"\nStarting evaluation at timestep {self.n_calls}")
 
             # Run evaluation rollout
-            episode_rewards = []
-            episode_lengths = []
-            portfolio_values = []
-            trades_info = []
-
             obs, _ = self.eval_env.reset()
             done = False
             truncated = False
+            episode_reward = 0
+            portfolio_values = []
+            trades_info = []
 
+            # Run single evaluation episode
             while not done and not truncated:
                 action, _ = self.model.predict(obs, deterministic=True)
                 obs, reward, done, truncated, info = self.eval_env.step(action)
-
-                episode_rewards.append(reward)
+                episode_reward += reward
                 portfolio_values.append(info["portfolio_value"])
 
-                if "trade_history" in info and info["trade_history"]:
+                if info.get("trade_history"):
                     trades_info.extend(info["trade_history"])
 
+            # Calculate evaluation metrics
+            eval_env = (
+                self.eval_env.envs[0]
+                if hasattr(self.eval_env, "envs")
+                else self.eval_env
+            )
+
+            # Calculate returns
+            returns = (
+                np.diff(portfolio_values) / portfolio_values[:-1]
+                if len(portfolio_values) > 1
+                else []
+            )
+
             # Calculate metrics
-            total_return = (
-                portfolio_values[-1] - portfolio_values[0]
-            ) / portfolio_values[0]
-
-            # Calculate buy & hold return using raw data
-            initial_price = self.eval_env.raw_data["close"].iloc[0]
-            final_price = self.eval_env.raw_data["close"].iloc[-1]
-            buy_hold_return = (final_price - initial_price) / initial_price
-
-            # Calculate trading metrics
-            if trades_info:
-                win_rate = len([t for t in trades_info if t.profit_loss > 0]) / len(
-                    trades_info
-                )
-                avg_profit_per_trade = np.mean([t.profit_loss for t in trades_info])
-                max_drawdown = self._calculate_max_drawdown(portfolio_values)
-
-                # Calculate Sharpe ratio
-                returns = np.diff(portfolio_values) / portfolio_values[:-1]
-                sharpe_ratio = (
-                    np.mean(returns) / np.std(returns) * np.sqrt(252)
-                    if len(returns) > 1
+            metrics = {
+                "eval/episode_reward": episode_reward,
+                "eval/episode_length": len(portfolio_values),
+                "eval/total_return": (
+                    (portfolio_values[-1] - portfolio_values[0]) / portfolio_values[0]
+                    if len(portfolio_values) > 0
                     else 0
-                )
+                ),
+                "eval/sharpe_ratio": (
+                    np.mean(returns) / (np.std(returns) + 1e-8) * np.sqrt(252)
+                    if len(returns) > 0
+                    else 0
+                ),
+                "eval/max_drawdown": self._calculate_max_drawdown(portfolio_values),
+                "eval/num_trades": len(trades_info),
+                "eval/win_rate": (
+                    len([t for t in trades_info if t.profit_loss > 0])
+                    / len(trades_info)
+                    if len(trades_info) > 0
+                    else 0
+                ),
+            }
 
-                # Calculate average trade duration
-                if len(trades_info) >= 2:
-                    trade_durations = []
-                    for i in range(0, len(trades_info) - 1, 2):  # Pair buy/sell trades
-                        if trades_info[i].action == "buy" and i + 1 < len(trades_info):
-                            duration = (
-                                trades_info[i + 1].timestamp - trades_info[i].timestamp
-                            )
-                            trade_durations.append(
-                                duration.total_seconds() / 3600
-                            )  # Convert to hours
-                    avg_trade_duration = (
-                        np.mean(trade_durations) if trade_durations else 0
+            # Create and log plots
+            if wandb.run is not None:
+                try:
+                    # Trading actions plot
+                    trade_fig = eval_env.plot_trading_actions(
+                        "Evaluation Trading Actions"
                     )
-                else:
-                    avg_trade_duration = 0
 
-                # Create evaluation plots
-                price_plot = self._create_price_plot(
-                    self.eval_env.raw_data["close"], trades_info
-                )
-                portfolio_plot = self._create_portfolio_plot(portfolio_values)
-                returns_plot = self._create_returns_plot(returns)
+                    # Portfolio value plot
+                    portfolio_fig = plt.figure(figsize=(10, 6))
+                    plt.plot(portfolio_values, label="Portfolio Value")
+                    plt.title("Portfolio Value Evolution")
+                    plt.xlabel("Step")
+                    plt.ylabel("Value")
+                    plt.legend()
 
-                # Log metrics and plots to wandb
-                wandb.log(
-                    {
-                        "eval/total_return": total_return,
-                        "eval/buy_hold_return": buy_hold_return,
-                        "eval/relative_return": total_return - buy_hold_return,
-                        "eval/win_rate": win_rate,
-                        "eval/avg_profit_per_trade": avg_profit_per_trade,
-                        "eval/max_drawdown": max_drawdown,
-                        "eval/sharpe_ratio": sharpe_ratio,
-                        "eval/avg_trade_duration": avg_trade_duration,
-                        "eval/num_trades": len(trades_info) // 2,
-                        "eval/portfolio_value": portfolio_values[-1],
-                        "eval/mean_reward": np.mean(episode_rewards),
-                        "eval/price_plot": wandb.Image(price_plot),
-                        "eval/portfolio_plot": wandb.Image(portfolio_plot),
-                        "eval/returns_plot": wandb.Image(returns_plot),
-                    },
-                    step=self.num_timesteps,
-                )
+                    # Returns distribution plot
+                    returns_fig = plt.figure(figsize=(10, 6))
+                    if len(returns) > 0:
+                        sns.histplot(returns, kde=True)
+                        plt.title("Returns Distribution")
+                        plt.xlabel("Return")
+                        plt.ylabel("Frequency")
 
-                plt.close("all")
+                    # Log everything
+                    wandb.log(
+                        {
+                            **metrics,
+                            "eval/trade_plot": wandb.Image(trade_fig),
+                            "eval/portfolio_plot": wandb.Image(portfolio_fig),
+                            "eval/returns_dist": wandb.Image(returns_fig),
+                        },
+                        step=self.num_timesteps,
+                    )
+
+                    plt.close("all")
+
+                    self.logger.info(f"Evaluation metrics at step {self.n_calls}:")
+                    for key, value in metrics.items():
+                        self.logger.info(f"{key}: {value:.4f}")
+
+                except Exception as e:
+                    self.logger.error(f"Error creating evaluation plots: {e}")
 
         return True
 
-    def _create_price_plot(self, prices, trades):
-        """Create price plot with buy/sell markers."""
-        fig, ax = plt.subplots(figsize=(12, 6))
-        ax.plot(prices.index, prices.values, label="Price", alpha=0.7)
-
-        # Add buy/sell markers
-        buy_trades = [t for t in trades if t.action == "buy"]
-        sell_trades = [t for t in trades if t.action == "sell"]
-
-        if buy_trades:
-            ax.scatter(
-                [t.timestamp for t in buy_trades],
-                [t.price for t in buy_trades],
-                marker="^",
-                color="green",
-                s=100,
-                label="Buy",
-            )
-
-        if sell_trades:
-            ax.scatter(
-                [t.timestamp for t in sell_trades],
-                [t.price for t in sell_trades],
-                marker="v",
-                color="red",
-                s=100,
-                label="Sell",
-            )
-
-        ax.set_title("Price and Trading Actions")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        plt.tight_layout()
-        return fig
-
-    def _create_portfolio_plot(self, portfolio_values):
-        """Create portfolio value plot."""
-        fig, ax = plt.subplots(figsize=(12, 6))
-        ax.plot(range(len(portfolio_values)), portfolio_values, label="Portfolio Value")
-        ax.set_title("Portfolio Value Over Time")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        plt.tight_layout()
-        return fig
-
-    def _create_returns_plot(self, returns):
-        """Create returns distribution plot."""
-        fig, ax = plt.subplots(figsize=(12, 6))
-        sns.histplot(returns, bins=50, ax=ax)
-        ax.set_title("Returns Distribution")
-        ax.grid(True, alpha=0.3)
-        plt.tight_layout()
-        return fig
-
     def _calculate_max_drawdown(self, portfolio_values: List[float]) -> float:
-        """Calculate the maximum drawdown from a list of portfolio values."""
         if not portfolio_values:
             return 0.0
-
         peak = portfolio_values[0]
         max_drawdown = 0.0
-
         for value in portfolio_values:
             if value > peak:
                 peak = value
             drawdown = (peak - value) / peak
             max_drawdown = max(max_drawdown, drawdown)
-
         return max_drawdown
+
+
+class CustomEvalCallback(EvalCallback):
+    """Custom evaluation callback with enhanced metrics and plots."""
+
+    def _on_step(self) -> bool:
+        if self.eval_freq > 0 and self.n_calls % self.eval_freq == 0:
+            try:
+                self.logger.info(f"\nStarting evaluation at timestep {self.n_calls}...")
+
+                total_episodes = self.n_eval_episodes
+                episode_rewards = []
+                episode_lengths = []
+
+                # Use tqdm instead of Progress
+                for episode in range(total_episodes):
+                    # Reset environment
+                    reset_result = self.eval_env.reset()
+                    if isinstance(reset_result, tuple):
+                        obs, _ = reset_result
+                    else:
+                        obs = reset_result
+
+                    done = False
+                    truncated = False
+                    episode_reward = 0.0
+                    episode_length = 0
+
+                    # Run episode
+
+                    while not done and not truncated:
+                        action, _ = self.model.predict(
+                            obs, deterministic=self.deterministic
+                        )
+                        step_result = self.eval_env.step(action)
+
+                        if len(step_result) == 5:
+                            obs, reward, done, truncated, _ = step_result
+                        else:
+                            obs, reward, done, _ = step_result
+                            truncated = False
+
+                        episode_reward += reward
+                        episode_length += 1
+
+                    episode_rewards.append(float(episode_reward))  # Convert to float
+                    episode_lengths.append(episode_length)
+
+                    self.logger.info(
+                        f"Episode {episode + 1}/{total_episodes} - "
+                        f"Length: {episode_length}, Return: {float(episode_reward):.2f}"
+                    )
+
+                self.logger.info("Evaluation completed. Processing metrics...")
+
+                # Get the trading environment
+                eval_env = (
+                    self.eval_env.envs[0]
+                    if hasattr(self.eval_env, "envs")
+                    else self.eval_env
+                )
+
+                # Calculate metrics with proper type conversion
+                portfolio_values = [float(v) for v in eval_env.portfolio_history]
+                trades = eval_env.trade_history
+
+                # Calculate returns safely
+                returns = []
+                if len(portfolio_values) > 1:
+                    returns = [
+                        float((v2 - v1) / v1)
+                        for v1, v2 in zip(portfolio_values[:-1], portfolio_values[1:])
+                    ]
+
+                asset_prices = eval_env.raw_data["close"].values
+                asset_returns = [
+                    float((p2 - p1) / p1)
+                    for p1, p2 in zip(asset_prices[:-1], asset_prices[1:])
+                ]
+
+                # Calculate metrics with safe operations
+                metrics = {
+                    "eval/mean_reward": float(np.mean(episode_rewards)),
+                    "eval/mean_ep_length": float(np.mean(episode_lengths)),
+                    "eval/sharpe_ratio": (
+                        float(
+                            np.mean(returns) / (np.std(returns) + 1e-8) * np.sqrt(252)
+                        )
+                        if returns
+                        else 0.0
+                    ),
+                    "eval/return_volatility": (
+                        float(np.std(returns) * np.sqrt(252)) if returns else 0.0
+                    ),
+                    "eval/asset_volatility": float(
+                        np.std(asset_returns) * np.sqrt(252)
+                    ),
+                    "eval/max_drawdown": self._calculate_max_drawdown(portfolio_values),
+                    "eval/trades_per_episode": len(trades) / len(episode_rewards),
+                    "eval/win_rate": (
+                        len([t for t in trades if t.profit_loss > 0]) / len(trades)
+                        if trades
+                        else 0.0
+                    ),
+                    "eval/avg_trade_duration": self._calculate_avg_trade_duration(
+                        trades
+                    ),
+                    "eval/total_return": (
+                        float(
+                            (portfolio_values[-1] - portfolio_values[0])
+                            / portfolio_values[0]
+                        )
+                        if portfolio_values
+                        else 0.0
+                    ),
+                    "eval/asset_return": float(
+                        (asset_prices[-1] - asset_prices[0]) / asset_prices[0]
+                    ),
+                }
+
+                # Create and log plots
+                if wandb.run is not None:
+                    try:
+                        # Trading actions plot
+                        trade_fig = eval_env.plot_trading_actions(
+                            "Evaluation Trading Actions"
+                        )
+
+                        # Portfolio value plot
+                        portfolio_fig = plt.figure(figsize=(10, 6))
+                        plt.plot(portfolio_values, label="Portfolio Value")
+                        plt.title("Portfolio Value Evolution")
+                        plt.xlabel("Step")
+                        plt.ylabel("Value")
+                        plt.legend()
+
+                        # Returns distribution plot
+                        returns_fig = plt.figure(figsize=(10, 6))
+                        if len(returns) > 0:
+                            sns.histplot(returns, kde=True)
+                            plt.title("Returns Distribution")
+                            plt.xlabel("Return")
+                            plt.ylabel("Frequency")
+
+                        # Log metrics and plots
+                        wandb.log(
+                            {
+                                **metrics,
+                                "eval/trade_plot": wandb.Image(trade_fig),
+                                "eval/portfolio_plot": wandb.Image(portfolio_fig),
+                                "eval/returns_dist": wandb.Image(returns_fig),
+                            },
+                            step=self.n_calls,
+                        )
+
+                        plt.close("all")
+                    except Exception as plot_error:
+                        self.logger.error(f"Error creating plots: {plot_error}")
+                        # Still try to log metrics even if plotting fails
+                        wandb.log(metrics, step=self.n_calls)
+
+                return True
+
+            except Exception as e:
+                self.logger.error(f"Error during evaluation: {e}")
+                return True  # Continue training even if evaluation fails
+
+        return True
+
+    def _calculate_max_drawdown(self, portfolio_values: List[float]) -> float:
+        if not portfolio_values:
+            return 0.0
+        peak = portfolio_values[0]
+        max_drawdown = 0.0
+        for value in portfolio_values:
+            if value > peak:
+                peak = value
+            drawdown = (peak - value) / peak
+            max_drawdown = max(max_drawdown, drawdown)
+        return max_drawdown
+
+    def _calculate_avg_trade_duration(self, trades: List[Trade]) -> float:
+        if len(trades) < 2:
+            return 0.0
+        durations = []
+        for i in range(0, len(trades) - 1, 2):  # Pair buy/sell trades
+            if trades[i].action == "buy" and i + 1 < len(trades):
+                duration = (
+                    trades[i + 1].timestamp - trades[i].timestamp
+                ).total_seconds() / 3600  # hours
+                durations.append(duration)
+        return np.mean(durations) if durations else 0.0
 
 
 class Trader:
@@ -749,87 +889,78 @@ class Trader:
         self.model = None
         self.env = None
 
-    def train_model(
+    async def train_model(
         self,
         train_data: pd.DataFrame,
         eval_data: pd.DataFrame,
-        hyperparams: Dict = None,
-        total_timesteps: int = 100000,
-    ) -> None:
-        """Train the RL model with given data and hyperparameters."""
+        hyperparams: Dict[str, Any],
+        total_timesteps: int,
+    ) -> Dict[str, Any]:
+        """Train the RL model."""
         try:
-            # Initialize wandb
-            wandb.init(
-                project=self.project_name,
-                config={
-                    "model_type": "PPO",
-                    "total_timesteps": total_timesteps,
-                    "device": self.device,
-                    "train_data_size": len(train_data),
-                    "eval_data_size": len(eval_data),
-                    **(hyperparams or {}),
-                },
-            )
+            # Initialize wandb and environments
+            run_name = f"trading_model_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            wandb.init(project="trading_rl", name=run_name, config=hyperparams)
 
-            # Default hyperparameters if none provided
-            if hyperparams is None:
-                hyperparams = {
-                    "learning_rate": 0.0003,
-                    "n_steps": 2048,
-                    "batch_size": 64,
-                    "n_epochs": 10,
-                    "gamma": 0.99,
-                    "gae_lambda": 0.95,
-                    "clip_range": 0.2,
-                    "ent_coef": 0.01,
-                    "vf_coef": 0.5,
-                    "max_grad_norm": 0.5,
-                }
+            train_env = TradingEnvironment(train_data, initial_balance=10000.0)
+            train_env = Monitor(train_env)
+            eval_env = TradingEnvironment(eval_data, initial_balance=10000.0)
+            eval_env = Monitor(eval_env)
 
-            # Create environments
-            self.env = Monitor(self.create_environment(train_data))
-            eval_env = Monitor(self.create_environment(eval_data))
-
-            # Initialize model with device
-            self.model = PPO(
-                "MlpPolicy",
-                self.env,
-                verbose=1,
-                tensorboard_log=self.tensorboard_log,
-                device=self.device,
-                **hyperparams,
-            )
-
-            # Setup callbacks
-            custom_callback = CustomTrainingCallback(
+            # Initialize callbacks
+            eval_callback = CustomTrainingCallback(
                 eval_env=eval_env,
-                eval_freq=1000,  # Evaluate every 1000 steps
+                eval_freq=hyperparams.get("eval_freq", 1000),
+                verbose=1,
             )
 
             checkpoint_callback = CheckpointCallback(
-                save_freq=10000,
-                save_path=self.model_dir,
-                name_prefix="ppo_trader",
+                save_freq=hyperparams.get("eval_freq", 1000),
+                save_path=f"{self.model_dir}/checkpoints",
+                name_prefix="trading_model",
+            )
+
+            # Initialize model
+            self.model = PPO(
+                policy=hyperparams.get("policy", "MlpPolicy"),
+                env=train_env,
+                learning_rate=hyperparams.get("learning_rate", 0.0003),
+                n_steps=hyperparams.get("n_steps", 2048),
+                batch_size=hyperparams.get("batch_size", 64),
+                n_epochs=hyperparams.get("n_epochs", 10),
+                gamma=hyperparams.get("gamma", 0.99),
+                gae_lambda=hyperparams.get("gae_lambda", 0.95),
+                clip_range=hyperparams.get("clip_range", 0.2),
+                clip_range_vf=hyperparams.get("clip_range_vf", None),
+                ent_coef=hyperparams.get("ent_coef", 0.01),
+                vf_coef=hyperparams.get("vf_coef", 0.5),
+                max_grad_norm=hyperparams.get("max_grad_norm", 0.5),
+                target_kl=hyperparams.get("target_kl", None),
+                tensorboard_log=self.tensorboard_log,
+                device=self.device,
+                verbose=1,
             )
 
             # Train the model
             self.model.learn(
                 total_timesteps=total_timesteps,
-                callback=[custom_callback, checkpoint_callback],
-                tb_log_name=f"ppo_trader_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                callback=[eval_callback, checkpoint_callback],
+                progress_bar=True,
             )
 
             # Save final model
-            final_model_path = os.path.join(self.model_dir, "final_model")
-            self.model.save(final_model_path)
-            self.logger.info(f"Final model saved to {final_model_path}")
+            self.model.save(f"{self.model_dir}/final_model")
+
+            return {
+                "model_path": f"{self.model_dir}/final_model",
+                "best_model_path": f"{self.model_dir}/best_model",
+            }
 
         except Exception as e:
-            self.logger.error(f"Error during training: {e}")
+            self.logger.error(f"Error during model training: {e}")
             raise
 
         finally:
-            # Close wandb run
             wandb.finish()
 
     def evaluate_performance(self, test_data: pd.DataFrame) -> Dict:
@@ -1021,6 +1152,7 @@ class Trader:
                 action_probs = self.model.policy.get_distribution(
                     torch.FloatTensor(obs.reshape(1, -1))
                 ).distribution.probs
+
                 confidence = float(action_probs[0][action])
 
                 # Get all action probabilities

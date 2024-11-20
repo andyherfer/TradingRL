@@ -6,14 +6,17 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from TradingRL.src.core.config_manager import ConfigManager, Environment, SystemMode
+from TradingRL.src.core.config_manager import ConfigManager
 from TradingRL.src.data.data_fetcher import DataFetcher
 from TradingRL.src.core.trader import Trader
-from TradingRL.src.analysis.market_analyzer import MarketAnalyzer
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 async def train_model(config_path: str, symbol: str, device: Optional[str] = None):
     """Train the RL model using historical data."""
+    data_fetcher = None
     try:
         # Initialize components
         config_manager = ConfigManager(
@@ -25,8 +28,8 @@ async def train_model(config_path: str, symbol: str, device: Optional[str] = Non
 
         # Initialize components
         data_fetcher = DataFetcher(
-            api_key=config_manager.get_secret("EXCHANGE_API_KEY"),
-            api_secret=config_manager.get_secret("EXCHANGE_API_SECRET"),
+            api_key=config_manager.get_secret("BINANCE_API_KEY"),
+            api_secret=config_manager.get_secret("BINANCE_API_SECRET"),
             symbols=[symbol],
             timeframes=config_manager.config["trading"]["timeframes"],
         )
@@ -38,7 +41,7 @@ async def train_model(config_path: str, symbol: str, device: Optional[str] = Non
         days = int(training_config["data_window"].replace("d", ""))
         start_date = end_date - timedelta(days=days)
 
-        print(f"Fetching training data from {start_date} to {end_date}")
+        logger.info(f"Fetching training data from {start_date} to {end_date}")
 
         # Fetch historical data with progress updates
         data = await data_fetcher.get_historical_data(
@@ -48,7 +51,7 @@ async def train_model(config_path: str, symbol: str, device: Optional[str] = Non
             end_time=end_date,
         )
 
-        print(f"Fetched {len(data)} data points")
+        logger.info(f"Fetched {len(data)} data points")
 
         if len(data) < 1000:
             raise ValueError("Insufficient data points for training")
@@ -58,43 +61,43 @@ async def train_model(config_path: str, symbol: str, device: Optional[str] = Non
         train_data = data[:train_size]
         test_data = data[train_size:]
 
-        print(f"Training set size: {len(train_data)} points")
-        print(f"Test set size: {len(test_data)} points")
+        logger.info(f"Training set size: {len(train_data)} points")
+        logger.info(f"Test set size: {len(test_data)} points")
 
         # Train model
-        print("Training model...")
-        total_timesteps = training_config["epochs"] * len(train_data)
-        print(f"Total training steps: {total_timesteps}")
+        logger.info("Training model...")
+        total_timesteps = training_config["n_epochs"] * len(train_data)
+        logger.info(f"Total training steps: {total_timesteps}")
 
         trader = Trader(
-            model_dir=config_manager.config["trader"]["model_dir"],
-            tensorboard_log=config_manager.config["trader"]["tensorboard_log"],
+            model_dir=training_config["model_dir"],
+            tensorboard_log=training_config["tensorboard_log"],
             device=device,
         )
 
-        trader.train_model(
+        await trader.train_model(
             train_data=train_data,
             eval_data=test_data,
-            hyperparams=training_config["model_params"],
+            hyperparams=training_config,
             total_timesteps=total_timesteps,
         )
 
-        print("Training completed!")
+        logger.info("Training completed!")
 
         # Evaluate model
-        print("Evaluating model...")
-        metrics = trader.evaluate_performance(test_data)
+        logger.info("Evaluating model...")
+        metrics = await trader.evaluate_performance(test_data)
 
-        print("\nEvaluation Metrics:")
-        print(f"Total Return: {metrics['total_return']:.2%}")
-        print(f"Sharpe Ratio: {metrics['sharpe_ratio']:.2f}")
-        print(f"Max Drawdown: {metrics['max_drawdown']:.2%}")
-        print(f"Win Rate: {metrics['win_rate']:.2%}")
-        print(f"Total Trades: {metrics['total_trades']}")
-        print(f"Profit Factor: {metrics['profit_factor']:.2f}")
+        logger.info("\nEvaluation Metrics:")
+        logger.info(f"Total Return: {metrics['total_return']:.2%}")
+        logger.info(f"Sharpe Ratio: {metrics['sharpe_ratio']:.2f}")
+        logger.info(f"Max Drawdown: {metrics['max_drawdown']:.2%}")
+        logger.info(f"Win Rate: {metrics['win_rate']:.2%}")
+        logger.info(f"Total Trades: {metrics['total_trades']}")
+        logger.info(f"Profit Factor: {metrics['profit_factor']:.2f}")
 
     except Exception as e:
-        print(f"Error during training: {e}")
+        logger.error(f"Error during training: {e}")
         raise
     finally:
         if data_fetcher:

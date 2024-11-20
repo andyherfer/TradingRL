@@ -5,6 +5,8 @@ PyYAML==6.0.1
 python-dotenv==1.0.0
 click==8.1.7
 pydantic==2.3.0
+tqdm
+rich
 
 # Machine Learning & RL
 # PyTorch - choose one of these based on your system:
