@@ -631,7 +631,7 @@ class CustomTrainingCallback(BaseCallback):
                     # Returns distribution plot
                     returns_fig = plt.figure(figsize=(10, 6))
                     if len(returns) > 0:
-                        sns.histplot(returns, kde=True)
+                        sns.histplot(returns, kde=True, bins=50)
                         plt.title("Returns Distribution")
                         plt.xlabel("Return")
                         plt.ylabel("Frequency")
@@ -921,7 +921,7 @@ class Trader:
             )
 
             # Add WandB callback for training metrics
-            wandb_callback = WandBCallback(check_freq=100)  # Log every 100 steps
+            wandb_callback = WandBCallback(check_freq=1000)  # Log every 1000 steps
 
             # Initialize model
             self.model = PPO(
