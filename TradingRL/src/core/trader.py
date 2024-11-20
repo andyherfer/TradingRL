@@ -220,6 +220,7 @@ class TradingEnvironment(gym.Env):
             if df[feature_cols].isna().any().any():
                 problematic_cols = (
                     df[feature_cols].columns[df[feature_cols].isna().any()].tolist()
+                )
                 raise ValueError(
                     f"NaN values still present in columns: {problematic_cols}"
                 )
