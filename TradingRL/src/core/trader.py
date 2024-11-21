@@ -70,6 +70,32 @@ class WandBCallback(BaseCallback):
                 self.episode_rewards = []
                 self.episode_lengths = []
 
+                # Log training info from the model
+                if "train" in self.locals and self.locals["train"] is not None:
+                    train_info = self.locals["train"]
+                    wandb.log(
+                        {
+                            "train/fps": self.locals.get("fps", 0),
+                            "train/time_elapsed": self.locals.get("time_elapsed", 0),
+                            "train/iterations": self.locals.get("iterations", 0),
+                            "train/approx_kl": train_info.get("approx_kl", 0),
+                            "train/clip_fraction": train_info.get("clip_fraction", 0),
+                            "train/clip_range": self.locals.get("clip_range", 0.2),
+                            "train/entropy_loss": train_info.get("entropy_loss", 0),
+                            "train/explained_variance": train_info.get(
+                                "explained_variance", 0
+                            ),
+                            "train/learning_rate": self.locals.get("learning_rate", 0),
+                            "train/loss": train_info.get("loss", 0),
+                            "train/n_updates": train_info.get("n_updates", 0),
+                            "train/policy_gradient_loss": train_info.get(
+                                "policy_gradient_loss", 0
+                            ),
+                            "train/value_loss": train_info.get("value_loss", 0),
+                        },
+                        step=self.n_calls,
+                    )
+
         except Exception as e:
             self.logger.warning(f"Error in WandB logging: {e}")
             # Continue training even if logging fails
@@ -221,6 +247,7 @@ class TradingEnvironment(gym.Env):
                 problematic_cols = (
                     df[feature_cols].columns[df[feature_cols].isna().any()].tolist()
                 )
+
                 raise ValueError(
                     f"NaN values still present in columns: {problematic_cols}"
                 )
@@ -315,19 +342,20 @@ class TradingEnvironment(gym.Env):
 
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, dict]:
         """Execute one time step within the environment."""
-        # Use raw_data for price information
-        current_price = float(self.raw_data.iloc[self.current_step]["close"])
-        old_portfolio_value = self.balance + self.position_value
-
         # Constants for reward calculation
         MAKER_FEE = 0.001  # 0.10% maker fee
         TAKER_FEE = 0.001  # 0.10% taker fee
-        ASYMMETRIC_LOSS_MULTIPLIER = 1.3  # Multiply losses by 2
+        HOLDING_PENALTY = 0.0001  # Reduced holding penalty
+        MIN_PROFIT_THRESHOLD = 0.002  # Minimum profit threshold (0.2%)
+        TRADE_COST_MULTIPLIER = 3.0  # Amplify impact of trading costs
+
+        current_price = float(self.raw_data.iloc[self.current_step]["close"])
+        old_portfolio_value = self.balance + self.position_value
 
         reward = 0
         trade_cost = 0
 
-        # Calculate price movement for this step
+        # Calculate price movement
         prev_price = (
             float(self.raw_data.iloc[self.current_step - 1]["close"])
             if self.current_step > 0
@@ -340,11 +368,15 @@ class TradingEnvironment(gym.Env):
         # Execute trading action
         if action == 1:  # Buy
             if self.balance > 0:
-                purchase_amount = self.balance * 0.95  # Keep some balance for fees
+                purchase_amount = self.balance * 0.95
                 trade_cost = purchase_amount * TAKER_FEE
                 new_position = (purchase_amount - trade_cost) / current_price
                 self.position += new_position
                 self.balance -= purchase_amount + trade_cost
+
+                # Penalize for opening position without clear upward trend
+                if price_change_pct < MIN_PROFIT_THRESHOLD:
+                    reward -= TRADE_COST_MULTIPLIER * (trade_cost / old_portfolio_value)
 
                 # Record trade
                 self.trade_history.append(
@@ -368,8 +400,17 @@ class TradingEnvironment(gym.Env):
                 last_trade = self.trade_history[-1] if self.trade_history else None
                 entry_price = last_trade.price if last_trade else current_price
                 profit_loss = net_sale_amount - (self.position * entry_price)
+                profit_pct = profit_loss / (self.position * entry_price)
 
                 self.balance += net_sale_amount
+
+                # Reward/penalty based on profit threshold
+                if profit_pct > MIN_PROFIT_THRESHOLD:
+                    # Reward proportional to profit
+                    reward += profit_pct
+                else:
+                    # Penalize for unprofitable trades
+                    reward -= abs(profit_pct) * TRADE_COST_MULTIPLIER
 
                 # Record trade
                 self.trade_history.append(
@@ -388,39 +429,42 @@ class TradingEnvironment(gym.Env):
         # Update position value
         self.position_value = self.position * current_price
 
-        # Calculate new portfolio value and return
+        # Calculate portfolio return
         new_portfolio_value = self.balance + self.position_value
-        value_change = new_portfolio_value - old_portfolio_value
-
-        # Calculate percentage return
-        pct_return = (
-            value_change / old_portfolio_value if old_portfolio_value > 0 else 0
+        portfolio_return = (
+            (new_portfolio_value - old_portfolio_value) / old_portfolio_value
+            if old_portfolio_value > 0
+            else 0
         )
 
-        # Calculate reward components
-        if action == 0:  # Hold
-            # Inverse reward for inaction based on price movement
-            # If price goes up, penalize for missing opportunity
-            # If price goes down, reward for avoiding loss
-            reward = -price_change_pct  # Inverse of the market movement
-
-            # Scale the reward based on whether we have a position
-            if self.position > 0:
-                # If we're holding a position, align reward with price movement
-                reward = price_change_pct
-            else:
-                # If we have no position, inverse reward (penalize missed gains, reward avoided losses)
-                reward = -price_change_pct
-
+        # Position-based reward component
+        if self.position > 0:
+            # Only reward for significant price increases
+            if price_change_pct > MIN_PROFIT_THRESHOLD:
+                reward += price_change_pct
+            elif price_change_pct < -MIN_PROFIT_THRESHOLD:
+                reward += (
+                    price_change_pct  # Penalty for holding during significant drops
+                )
         else:
-            # For trades, use asymmetric reward based on return
-            if pct_return > 0:
-                reward = pct_return
-            else:
-                reward = pct_return * ASYMMETRIC_LOSS_MULTIPLIER
+            # Small reward for avoiding significant drops
+            if price_change_pct < -MIN_PROFIT_THRESHOLD:
+                reward += abs(price_change_pct) * 0.1
 
-            # Subtract trading costs from reward
-            reward -= trade_cost / old_portfolio_value
+        # Very small holding penalty when no position
+        if self.position == 0 and action == 0:
+            reward -= HOLDING_PENALTY
+
+        # Penalize heavily for trading costs
+        if trade_cost > 0:
+            reward -= (trade_cost / old_portfolio_value) * TRADE_COST_MULTIPLIER
+
+        # Add portfolio return component only for significant changes
+        if abs(portfolio_return) > MIN_PROFIT_THRESHOLD:
+            reward += portfolio_return
+
+        # Clip reward to prevent extreme values
+        reward = np.clip(reward, -1.0, 1.0)
 
         # Move to next step
         self.current_step += 1
@@ -440,14 +484,14 @@ class TradingEnvironment(gym.Env):
             "trade_history": self.trade_history,
             "current_price": current_price,
             "trade_cost": trade_cost,
-            "pct_return": pct_return,
+            "pct_return": portfolio_return,
             "reward": reward,
             "price_change_pct": price_change_pct,
             "action": action,
         }
 
         # Add portfolio value to history
-        self.portfolio_history.append(self.balance + self.position_value)
+        self.portfolio_history.append(new_portfolio_value)
 
         return obs, reward, terminated, truncated, info
 
@@ -458,11 +502,45 @@ class TradingEnvironment(gym.Env):
         # Plot price using raw_data
         ax.plot(self.raw_data.index, self.raw_data["close"], label="Price", alpha=0.7)
 
-        # Plot buy points
-        buy_trades = [t for t in self.trade_history if t.action == "buy"]
-        if buy_trades:
-            buy_times = [t.timestamp for t in buy_trades]
-            buy_prices = [t.price for t in buy_trades]
+        # Process trades to identify redundant ones
+        last_action = None
+        buy_times, buy_prices, redundant_buy_times, redundant_buy_prices = (
+            [],
+            [],
+            [],
+            [],
+        )
+        sell_times, sell_prices, redundant_sell_times, redundant_sell_prices = (
+            [],
+            [],
+            [],
+            [],
+        )
+
+        for trade in self.trade_history:
+            if trade.action == "buy":
+                if last_action != "buy":
+                    # First buy after a sell or at start
+                    buy_times.append(trade.timestamp)
+                    buy_prices.append(trade.price)
+                else:
+                    # Redundant buy (already holding position)
+                    redundant_buy_times.append(trade.timestamp)
+                    redundant_buy_prices.append(trade.price)
+                last_action = "buy"
+            else:  # sell
+                if last_action != "sell":
+                    # First sell after a buy
+                    sell_times.append(trade.timestamp)
+                    sell_prices.append(trade.price)
+                else:
+                    # Redundant sell (no position to sell)
+                    redundant_sell_times.append(trade.timestamp)
+                    redundant_sell_prices.append(trade.price)
+                last_action = "sell"
+
+        # Plot valid buy points
+        if buy_times:
             ax.scatter(
                 buy_times,
                 buy_prices,
@@ -470,14 +548,23 @@ class TradingEnvironment(gym.Env):
                 marker="^",
                 s=100,
                 label="Buy",
-                alpha=0.7,
+                alpha=0.9,
             )
 
-        # Plot sell points
-        sell_trades = [t for t in self.trade_history if t.action == "sell"]
-        if sell_trades:
-            sell_times = [t.timestamp for t in sell_trades]
-            sell_prices = [t.price for t in sell_trades]
+        # Plot redundant buy points
+        if redundant_buy_times:
+            ax.scatter(
+                redundant_buy_times,
+                redundant_buy_prices,
+                color="green",
+                marker="^",
+                s=100,
+                label="Redundant Buy",
+                alpha=0.3,
+            )
+
+        # Plot valid sell points
+        if sell_times:
             ax.scatter(
                 sell_times,
                 sell_prices,
@@ -485,7 +572,19 @@ class TradingEnvironment(gym.Env):
                 marker="v",
                 s=100,
                 label="Sell",
-                alpha=0.7,
+                alpha=0.9,
+            )
+
+        # Plot redundant sell points
+        if redundant_sell_times:
+            ax.scatter(
+                redundant_sell_times,
+                redundant_sell_prices,
+                color="red",
+                marker="v",
+                s=100,
+                label="Redundant Sell",
+                alpha=0.3,
             )
 
         ax.set_title(title)
@@ -889,7 +988,7 @@ class Trader:
         self.model = None
         self.env = None
 
-    async def train_model(
+    def train_model(
         self,
         train_data: pd.DataFrame,
         eval_data: pd.DataFrame,

@@ -26,7 +26,7 @@ async def train_model(config_path: str, symbol: str, device: Optional[str] = Non
         # Get configuration
         training_config = config_manager.config["trader"]["training"]
 
-        # Initialize components
+        # Initialize components and fetch data (async operations)
         data_fetcher = DataFetcher(
             api_key=config_manager.get_secret("BINANCE_API_KEY"),
             api_secret=config_manager.get_secret("BINANCE_API_SECRET"),
@@ -34,7 +34,7 @@ async def train_model(config_path: str, symbol: str, device: Optional[str] = Non
             timeframes=config_manager.config["trading"]["timeframes"],
         )
 
-        await data_fetcher.initialize()
+        await data_fetcher.initialize()  # Async operation
 
         # Calculate date range for training data
         end_date = datetime.now()
@@ -43,14 +43,15 @@ async def train_model(config_path: str, symbol: str, device: Optional[str] = Non
 
         logger.info(f"Fetching training data from {start_date} to {end_date}")
 
-        # Fetch historical data with progress updates
+        # Fetch historical data (async operation)
         data = await data_fetcher.get_historical_data(
             symbol=symbol,
-            timeframe="1h",  # Base timeframe for training
+            timeframe="1h",
             start_time=start_date,
             end_time=end_date,
         )
 
+        # From here on, everything is synchronous
         logger.info(f"Fetched {len(data)} data points")
 
         if len(data) < 1000:
@@ -75,7 +76,8 @@ async def train_model(config_path: str, symbol: str, device: Optional[str] = Non
             device=device,
         )
 
-        await trader.train_model(
+        # Call synchronous train_model
+        trader.train_model(
             train_data=train_data,
             eval_data=test_data,
             hyperparams=training_config,
@@ -86,7 +88,7 @@ async def train_model(config_path: str, symbol: str, device: Optional[str] = Non
 
         # Evaluate model
         logger.info("Evaluating model...")
-        metrics = await trader.evaluate_performance(test_data)
+        metrics = trader.evaluate_performance(test_data)
 
         logger.info("\nEvaluation Metrics:")
         logger.info(f"Total Return: {metrics['total_return']:.2%}")
@@ -101,7 +103,7 @@ async def train_model(config_path: str, symbol: str, device: Optional[str] = Non
         raise
     finally:
         if data_fetcher:
-            await data_fetcher.close()
+            await data_fetcher.close()  # Async cleanup
 
 
 @click.command()
