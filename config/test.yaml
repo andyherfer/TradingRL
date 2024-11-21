@@ -1,0 +1,50 @@
+exchange:
+  api_key: test_key
+  api_secret: test_secret
+  name: binance_test
+  rate_limit: 1200
+  testnet: true
+  timeout: 30000
+risk:
+  max_drawdown: 0.1
+  max_leverage: 1.0
+  max_position_size: 1.0
+  position_sizing_method: kelly
+  risk_per_trade: 0.02
+trading:
+  base_currency: USDT
+  initial_capital: 10000.0
+  symbols:
+    - BTC/USDT
+  timeframes:
+    - 1h
+trader:
+  training:
+    data_window: "1400d"
+    train_test_split: 0.8
+    n_epochs: 10
+    eval_freq: 10000
+    n_eval_episodes: 5
+    policy: "MlpPolicy"
+    model_params:
+      net_arch:
+        pi: [256, 256]
+        vf: [256, 256]
+      activation_fn: "tanh"
+      learning_rate: 0.0001
+      n_steps: 2048
+      batch_size: 64
+      n_epochs: 10
+      gamma: 0.99
+      gae_lambda: 0.95
+      clip_range: 0.2
+      clip_range_vf: 0.2
+      ent_coef: 0.005
+      vf_coef: 0.5
+      max_grad_norm: 0.5
+      target_kl: 0.015
+      normalize_advantage: true
+      normalize_observations: true
+    model_dir: "data/models"
+    tensorboard_log: "data/logs"
+    save_freq: 10000
