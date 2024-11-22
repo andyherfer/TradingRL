@@ -18,6 +18,10 @@ class MockTrader:
         if self.force_error:
             raise ValueError("Simulated prediction error")
 
+        # Validate input state
+        if len(state) == 0:
+            raise ValueError("Empty state array")
+
         # Cycle through different actions for testing
         action = len(self.predictions) % 5  # 0-4 for different signal types
         confidence = 0.5 + (len(self.predictions) % 5) * 0.1  # 0.5-0.9
@@ -46,3 +50,7 @@ class MockTrader:
     def load(self, path: str) -> None:
         """Mock load."""
         self.trained = True
+
+    async def close(self) -> None:
+        """Mock close."""
+        pass

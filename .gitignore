@@ -164,6 +164,7 @@ cython_debug/
 # Project specific
 # Data and caches
 data/
+!src/data/data_fetcher.py
 data_cache/
 market_data.db
 *.db

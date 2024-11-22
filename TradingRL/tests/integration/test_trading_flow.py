@@ -93,7 +93,7 @@ async def test_event_propagation(event_manager, data_fetcher, market_data):
     )
 
     # Set test market data and event manager
-    data_fetcher.base_fetcher.test_market_data = market_data
+    data_fetcher.test_market_data = market_data
     data_fetcher.event_manager = event_manager  # Set event manager
 
     try:
