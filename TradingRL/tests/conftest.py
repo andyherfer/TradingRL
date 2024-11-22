@@ -23,8 +23,11 @@ def test_config():
     config_dir = Path("config")
     config_dir.mkdir(parents=True, exist_ok=True)
 
-    # Create test config file
-    test_config_path = config_dir / "test.yaml"
+    # Use a temporary config file name for tests
+    temp_config_name = f"test_config_{datetime.now().strftime('%Y%m%d_%H%M%S')}.yaml"
+    temp_config_path = config_dir / temp_config_name
+
+    # Create test config
     test_config = {
         "exchange": {
             "name": "binance_test",
@@ -49,10 +52,22 @@ def test_config():
         },
     }
 
-    with open(test_config_path, "w") as f:
+    with open(temp_config_path, "w") as f:
         yaml.dump(test_config, f)
 
-    return ConfigManager(base_path=str(config_dir), env="test", mode="test")
+    # Create ConfigManager with the temporary config file
+    config_manager = ConfigManager(
+        base_path=str(config_dir),
+        env="test",
+        mode="test",
+        config_file=temp_config_name,  # Use the temporary config file
+    )
+
+    yield config_manager
+
+    # Cleanup: remove temporary config file
+    if temp_config_path.exists():
+        temp_config_path.unlink()
 
 
 @pytest.fixture

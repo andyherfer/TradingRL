@@ -93,14 +93,15 @@ class ConfigManager:
     base_path: str = "config"
     env: Environment = Environment.DEVELOPMENT
     mode: SystemMode = SystemMode.PAPER
-    _config_file: str = field(default="config.yaml", init=False)  # Private field
-    _secrets_file: str = field(default=".env", init=False)  # Private field
+    config_file: str = field(default="config.yaml")
+    _secrets_file: str = field(default=".env", init=False)
 
     def __init__(
         self,
         base_path: Optional[str] = None,
         env: Optional[str] = None,
         mode: Optional[str] = None,
+        config_file: Optional[str] = None,
     ):
         """Initialize Configuration Manager."""
         # Set paths
@@ -115,6 +116,7 @@ class ConfigManager:
             if mode
             else SystemMode(os.getenv("SYSTEM_MODE", "paper").lower())
         )
+        self.config_file = config_file or "config.yaml"
 
         # Initialize paths
         self.config_dir = Path(self.base_path)
@@ -135,8 +137,8 @@ class ConfigManager:
     def _load_configurations(self) -> None:
         """Load all configuration files."""
         try:
-            # Load main config
-            config_path = self.config_dir / "test.yaml"  # Fixed path for test config
+            # Load main config using the specified config file
+            config_path = self.config_dir / self.config_file
             if config_path.exists():
                 with open(config_path) as f:
                     self.config = yaml.safe_load(f)
@@ -264,7 +266,7 @@ class ConfigManager:
     def save(self) -> None:
         """Save current configuration to file."""
         try:
-            config_path = self.config_dir / f"{self.env.value}_{self._config_file}"
+            config_path = self.config_dir / f"{self.env.value}_{self.config_file}"
 
             # Backup existing config
             if config_path.exists():
